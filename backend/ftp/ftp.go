@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jlaffaye/ftp"
+	"github.com/BenefitsDataTrust/ftp"
 	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -52,10 +52,11 @@ func init() {
 				IsPassword: true,
 				Required:   true,
 			}, {
-				Name:    "tls",
-				Help:    "Use FTP over TLS (Implicit)",
-				Default: false,
-			}, {
+				Name:    "implict_tls",
+				Help:    "Use FTP over TLS (input Implicit or Explicit) or leave blank to not use TLS",
+				Default: "",
+			},
+			{
 				Name:     "concurrency",
 				Help:     "Maximum number of FTP simultaneous connections, 0 for unlimited",
 				Default:  0,
@@ -81,7 +82,7 @@ type Options struct {
 	User              string `config:"user"`
 	Pass              string `config:"pass"`
 	Port              string `config:"port"`
-	TLS               bool   `config:"tls"`
+	TLS               string `config:"tls"`
 	Concurrency       int    `config:"concurrency"`
 	SkipVerifyTLSCert bool   `config:"no_check_certificate"`
 	DisableEPSV       bool   `config:"disable_epsv"`
@@ -143,12 +144,12 @@ func (f *Fs) Features() *fs.Features {
 func (f *Fs) ftpConnection() (*ftp.ServerConn, error) {
 	fs.Debugf(f, "Connecting to FTP server")
 	ftpConfig := []ftp.DialOption{ftp.DialWithTimeout(fs.Config.ConnectTimeout)}
-	if f.opt.TLS {
+	if len(f.opt.TLS) > 0 {
 		tlsConfig := &tls.Config{
 			ServerName:         f.opt.Host,
 			InsecureSkipVerify: f.opt.SkipVerifyTLSCert,
 		}
-		ftpConfig = append(ftpConfig, ftp.DialWithTLS(tlsConfig))
+		ftpConfig = append(ftpConfig, ftp.DialWithTLS(tlsConfig, f.opt.TLS))
 	}
 	if f.opt.DisableEPSV {
 		ftpConfig = append(ftpConfig, ftp.DialWithDisabledEPSV(true))

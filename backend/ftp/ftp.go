@@ -4,6 +4,7 @@ package ftp
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net/textproto"
 	"os"
@@ -149,7 +150,16 @@ func (f *Fs) ftpConnection() (*ftp.ServerConn, error) {
 			ServerName:         f.opt.Host,
 			InsecureSkipVerify: f.opt.SkipVerifyTLSCert,
 		}
-		ftpConfig = append(ftpConfig, ftp.DialWithTLS(tlsConfig, f.opt.TLS))
+		if f.opt.TLS == "Implicit" {
+			explicitTLS := false
+			ftpConfig = append(ftpConfig, ftp.DialWithTLS(tlsConfig, explicitTLS))
+		} else if f.opt.TLS == "Explicit" {
+			explicitTLS := true
+			ftpConfig = append(ftpConfig, ftp.DialWithTLS(tlsConfig, explicitTLS))
+		} else {
+			fmt.Printf("Only Implicit and Explicit are valid values for TLS")
+			os.Exit(1)
+		}
 	}
 	if f.opt.DisableEPSV {
 		ftpConfig = append(ftpConfig, ftp.DialWithDisabledEPSV(true))
@@ -239,7 +249,7 @@ func NewFs(name, root string, m configmap.Mapper) (ff fs.Fs, err error) {
 
 	dialAddr := opt.Host + ":" + port
 	protocol := "ftp://"
-	if opt.TLS {
+	if len(opt.TLS) > 0 {
 		protocol = "ftps://"
 	}
 	u := protocol + path.Join(dialAddr+"/", root)

@@ -12,7 +12,15 @@ RUN ./rclone version
 # Begin final image
 FROM alpine:latest
 
+ENV PATH $PATH:/root/google-cloud-sdk/bin
+
 RUN apk --no-cache add ca-certificates fuse
+# Install gsutil for kms usage
+RUN apk add --update python \ 
+                     curl \ 
+                     which \ 
+                     bash
+RUN curl -sSL https://sdk.cloud.google.com | bash
 
 COPY --from=builder /go/src/github.com/rclone/rclone/rclone /usr/local/bin/
 

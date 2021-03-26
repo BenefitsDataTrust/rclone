@@ -4,7 +4,7 @@ package hubic
 
 // This uses the normal swift mechanism to update the credentials and
 // ignores the expires field returned by the Hubic API.  This may need
-// to be revisted after some actual experience.
+// to be revisited after some actual experience.
 
 import (
 	"context"
@@ -16,11 +16,10 @@ import (
 	"strings"
 	"time"
 
-	swiftLib "github.com/ncw/swift"
+	swiftLib "github.com/ncw/swift/v2"
 	"github.com/pkg/errors"
 	"github.com/rclone/rclone/backend/swift"
 	"github.com/rclone/rclone/fs"
-	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/config/obscure"
@@ -39,7 +38,7 @@ var (
 	// Description of how to auth for this app
 	oauthConfig = &oauth2.Config{
 		Scopes: []string{
-			"credentials.r", // Read Openstack credentials
+			"credentials.r", // Read OpenStack credentials
 		},
 		Endpoint: oauth2.Endpoint{
 			AuthURL:  "https://api.hubic.com/oauth/auth/",
@@ -57,28 +56,22 @@ func init() {
 		Name:        "hubic",
 		Description: "Hubic",
 		NewFs:       NewFs,
-		Config: func(name string, m configmap.Mapper) {
-			err := oauthutil.Config("hubic", name, m, oauthConfig)
+		Config: func(ctx context.Context, name string, m configmap.Mapper) {
+			err := oauthutil.Config(ctx, "hubic", name, m, oauthConfig, nil)
 			if err != nil {
 				log.Fatalf("Failed to configure token: %v", err)
 			}
 		},
-		Options: append([]fs.Option{{
-			Name: config.ConfigClientID,
-			Help: "Hubic Client Id\nLeave blank normally.",
-		}, {
-			Name: config.ConfigClientSecret,
-			Help: "Hubic Client Secret\nLeave blank normally.",
-		}}, swift.SharedOptions...),
+		Options: append(oauthutil.SharedOptions, swift.SharedOptions...),
 	})
 }
 
 // credentials is the JSON returned from the Hubic API to read the
 // OpenStack credentials
 type credentials struct {
-	Token    string `json:"token"`    // Openstack token
-	Endpoint string `json:"endpoint"` // Openstack endpoint
-	Expires  string `json:"expires"`  // Expires date - eg "2015-11-09T14:24:56+01:00"
+	Token    string `json:"token"`    // OpenStack token
+	Endpoint string `json:"endpoint"` // OpenStack endpoint
+	Expires  string `json:"expires"`  // Expires date - e.g. "2015-11-09T14:24:56+01:00"
 }
 
 // Fs represents a remote hubic
@@ -117,11 +110,10 @@ func (f *Fs) String() string {
 //
 // The credentials are read into the Fs
 func (f *Fs) getCredentials(ctx context.Context) (err error) {
-	req, err := http.NewRequest("GET", "https://api.hubic.com/1.0/account/credentials", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.hubic.com/1.0/account/credentials", nil)
 	if err != nil {
 		return err
 	}
-	req = req.WithContext(ctx) // go1.13 can use NewRequestWithContext
 	resp, err := f.client.Do(req)
 	if err != nil {
 		return err
@@ -153,8 +145,8 @@ func (f *Fs) getCredentials(ctx context.Context) (err error) {
 }
 
 // NewFs constructs an Fs from the path, container:path
-func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
-	client, _, err := oauthutil.NewClient(name, m, oauthConfig)
+func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
+	client, _, err := oauthutil.NewClient(ctx, name, m, oauthConfig)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to configure Hubic")
 	}
@@ -164,13 +156,14 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	}
 
 	// Make the swift Connection
+	ci := fs.GetConfig(ctx)
 	c := &swiftLib.Connection{
 		Auth:           newAuth(f),
-		ConnectTimeout: 10 * fs.Config.ConnectTimeout, // Use the timeouts in the transport
-		Timeout:        10 * fs.Config.Timeout,        // Use the timeouts in the transport
-		Transport:      fshttp.NewTransport(fs.Config),
+		ConnectTimeout: 10 * ci.ConnectTimeout, // Use the timeouts in the transport
+		Timeout:        10 * ci.Timeout,        // Use the timeouts in the transport
+		Transport:      fshttp.NewTransport(ctx),
 	}
-	err = c.Authenticate()
+	err = c.Authenticate(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "error authenticating swift connection")
 	}
@@ -183,7 +176,7 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	}
 
 	// Make inner swift Fs from the connection
-	swiftFs, err := swift.NewFsWithConnection(opt, name, root, c, true)
+	swiftFs, err := swift.NewFsWithConnection(ctx, opt, name, root, c, true)
 	if err != nil && err != fs.ErrorIsFile {
 		return nil, err
 	}

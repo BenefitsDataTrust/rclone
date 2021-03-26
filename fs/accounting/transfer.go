@@ -1,12 +1,14 @@
 package accounting
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"sync"
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/rc"
 )
 
 // TransferSnapshot represents state of an account at point in time.
@@ -84,7 +86,7 @@ func newTransferRemoteSize(stats *StatsInfo, remote string, size int64, checking
 
 // Done ends the transfer.
 // Must be called after transfer is finished to run proper cleanups.
-func (tr *Transfer) Done(err error) {
+func (tr *Transfer) Done(ctx context.Context, err error) {
 	if err != nil {
 		err = tr.stats.Error(err)
 
@@ -97,10 +99,11 @@ func (tr *Transfer) Done(err error) {
 	acc := tr.acc
 	tr.mu.RUnlock()
 
+	ci := fs.GetConfig(ctx)
 	if acc != nil {
 		// Close the file if it is still open
 		if err := acc.Close(); err != nil {
-			fs.LogLevelPrintf(fs.Config.StatsLogLevel, nil, "can't close account: %+v\n", err)
+			fs.LogLevelPrintf(ci.StatsLogLevel, nil, "can't close account: %+v\n", err)
 		}
 		// Signal done with accounting
 		acc.Done()
@@ -121,26 +124,27 @@ func (tr *Transfer) Done(err error) {
 }
 
 // Reset allows to switch the Account to another transfer method.
-func (tr *Transfer) Reset() {
+func (tr *Transfer) Reset(ctx context.Context) {
 	tr.mu.RLock()
 	acc := tr.acc
 	tr.acc = nil
 	tr.mu.RUnlock()
+	ci := fs.GetConfig(ctx)
 
 	if acc != nil {
 		if err := acc.Close(); err != nil {
-			fs.LogLevelPrintf(fs.Config.StatsLogLevel, nil, "can't close account: %+v\n", err)
+			fs.LogLevelPrintf(ci.StatsLogLevel, nil, "can't close account: %+v\n", err)
 		}
 	}
 }
 
 // Account returns reader that knows how to keep track of transfer progress.
-func (tr *Transfer) Account(in io.ReadCloser) *Account {
+func (tr *Transfer) Account(ctx context.Context, in io.ReadCloser) *Account {
 	tr.mu.Lock()
 	if tr.acc == nil {
-		tr.acc = newAccountSizeName(tr.stats, in, tr.size, tr.remote)
+		tr.acc = newAccountSizeName(ctx, tr.stats, in, tr.size, tr.remote)
 	} else {
-		tr.acc.UpdateReader(in)
+		tr.acc.UpdateReader(ctx, in)
 	}
 	tr.mu.Unlock()
 	return tr.acc
@@ -179,5 +183,13 @@ func (tr *Transfer) Snapshot() TransferSnapshot {
 		CompletedAt: tr.completedAt,
 		Error:       tr.err,
 		Group:       tr.stats.group,
+	}
+}
+
+// rcStats returns stats for the transfer suitable for the rc
+func (tr *Transfer) rcStats() rc.Params {
+	return rc.Params{
+		"name": tr.remote, // no locking needed to access thess
+		"size": tr.size,
 	}
 }

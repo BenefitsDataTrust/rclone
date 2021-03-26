@@ -253,8 +253,10 @@ type MoveItemRequest struct {
 //CreateShareLinkRequest is the request to create a sharing link
 //Always Type:view and Scope:anonymous for public sharing
 type CreateShareLinkRequest struct {
-	Type  string `json:"type"`            //Link type in View, Edit or Embed
-	Scope string `json:"scope,omitempty"` //Optional. Scope in anonymousi, organization
+	Type     string     `json:"type"`                         // Link type in View, Edit or Embed
+	Scope    string     `json:"scope,omitempty"`              // Scope in anonymous, organization
+	Password string     `json:"password,omitempty"`           // The password of the sharing link that is set by the creator. Optional and OneDrive Personal only.
+	Expiry   *time.Time `json:"expirationDateTime,omitempty"` // A String with format of yyyy-MM-ddTHH:mm:ssZ of DateTime indicates the expiration time of the permission.
 }
 
 //CreateShareLinkResponse is the response from CreateShareLinkRequest
@@ -272,19 +274,20 @@ type CreateShareLinkResponse struct {
 	} `json:"link"`
 }
 
-// AsyncOperationStatus provides information on the status of a asynchronous job progress.
+// AsyncOperationStatus provides information on the status of an asynchronous job progress.
 //
 // The following API calls return AsyncOperationStatus resources:
 //
 // Copy Item
 // Upload From URL
 type AsyncOperationStatus struct {
-	PercentageComplete float64 `json:"percentageComplete"` // An float value between 0 and 100 that indicates the percentage complete.
+	PercentageComplete float64 `json:"percentageComplete"` // A float value between 0 and 100 that indicates the percentage complete.
 	Status             string  `json:"status"`             // A string value that maps to an enumeration of possible values about the status of the job. "notStarted | inProgress | completed | updating | failed | deletePending | deleteFailed | waiting"
+	ErrorCode          string  `json:"errorCode"`          // Not officially documented :(
 }
 
 // GetID returns a normalized ID of the item
-// If DriveID is known it will be prefixed to the ID with # seperator
+// If DriveID is known it will be prefixed to the ID with # separator
 // Can be parsed using onedrive.parseNormalizedID(normalizedID)
 func (i *Item) GetID() string {
 	if i.IsRemote() && i.RemoteItem.ID != "" {
@@ -409,4 +412,29 @@ func (i *Item) GetParentReference() *ItemReference {
 // IsRemote checks if item is a remote item
 func (i *Item) IsRemote() bool {
 	return i.RemoteItem != nil
+}
+
+// User details for each version
+type User struct {
+	Email       string `json:"email"`
+	ID          string `json:"id"`
+	DisplayName string `json:"displayName"`
+}
+
+// LastModifiedBy for each version
+type LastModifiedBy struct {
+	User User `json:"user"`
+}
+
+// Version info
+type Version struct {
+	ID                   string         `json:"id"`
+	LastModifiedDateTime time.Time      `json:"lastModifiedDateTime"`
+	Size                 int            `json:"size"`
+	LastModifiedBy       LastModifiedBy `json:"lastModifiedBy"`
+}
+
+// VersionsResponse is returned from /versions
+type VersionsResponse struct {
+	Versions []Version `json:"value"`
 }

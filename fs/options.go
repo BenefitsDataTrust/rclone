@@ -42,8 +42,8 @@ type OpenOption interface {
 //
 //     RangeOption{Start: 0, End: 99} - fetch the first 100 bytes
 //     RangeOption{Start: 100, End: 199} - fetch the second 100 bytes
-//     RangeOption{Start: 100} - fetch bytes from offset 100 to the end
-//     RangeOption{End: 100} - fetch the last 100 bytes
+//     RangeOption{Start: 100, End: -1} - fetch bytes from offset 100 to the end
+//     RangeOption{Start: -1, End: 100} - fetch the last 100 bytes
 //
 // A RangeOption implements a single byte-range-spec from
 // https://tools.ietf.org/html/rfc7233#section-2.1
@@ -136,15 +136,15 @@ func (o *RangeOption) Decode(size int64) (offset, limit int64) {
 // FixRangeOption looks through the slice of options and adjusts any
 // RangeOption~s found that request a fetch from the end into an
 // absolute fetch using the size passed in and makes sure the range does
-// not exceed filesize. Some remotes (eg Onedrive, Box) don't support
+// not exceed filesize. Some remotes (e.g. Onedrive, Box) don't support
 // range requests which index from the end.
 func FixRangeOption(options []OpenOption, size int64) {
 	if size == 0 {
 		// if size 0 then remove RangeOption~s
-		// replacing with an empty HTTPOption~s which won't be rendered
+		// replacing with a NullOptions~s which won't be rendered
 		for i := range options {
 			if _, ok := options[i].(*RangeOption); ok {
-				options[i] = &HTTPOption{}
+				options[i] = NullOption{}
 
 			}
 		}
@@ -230,6 +230,25 @@ func (o *HashesOption) Mandatory() bool {
 	return false
 }
 
+// NullOption defines an Option which does nothing
+type NullOption struct {
+}
+
+// Header formats the option as an http header
+func (o NullOption) Header() (key string, value string) {
+	return "", ""
+}
+
+// String formats the option into human readable form
+func (o NullOption) String() string {
+	return fmt.Sprintf("NullOption()")
+}
+
+// Mandatory returns whether the option must be parsed or can be ignored
+func (o NullOption) Mandatory() bool {
+	return false
+}
+
 // OpenOptionAddHeaders adds each header found in options to the
 // headers map provided the key was non empty.
 func OpenOptionAddHeaders(options []OpenOption, headers map[string]string) {
@@ -264,10 +283,3 @@ func OpenOptionAddHTTPHeaders(headers http.Header, options []OpenOption) {
 		}
 	}
 }
-
-// check interface
-var (
-	_ OpenOption = (*RangeOption)(nil)
-	_ OpenOption = (*SeekOption)(nil)
-	_ OpenOption = (*HTTPOption)(nil)
-)

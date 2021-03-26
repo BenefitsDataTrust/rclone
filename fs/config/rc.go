@@ -72,7 +72,7 @@ See the [listremotes command](/commands/rclone_listremotes/) command for more in
 // Return the a list of remotes in the config file
 func rcListRemotes(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 	var remotes = []string{}
-	for _, remote := range getConfigData().GetSectionList() {
+	for _, remote := range Data.GetSectionList() {
 		remotes = append(remotes, remote)
 	}
 	out = rc.Params{
@@ -111,6 +111,10 @@ func init() {
 		if name == "create" {
 			extraHelp = "- type - type of the new remote\n"
 		}
+		if name == "create" || name == "update" {
+			extraHelp += "- obscure - optional bool - forces obscuring of passwords\n"
+			extraHelp += "- noObscure - optional bool - forces passwords not to be obscured\n"
+		}
 		rc.Add(rc.Call{
 			Path:         "config/" + name,
 			AuthRequired: true,
@@ -140,17 +144,19 @@ func rcConfig(ctx context.Context, in rc.Params, what string) (out rc.Params, er
 	if err != nil {
 		return nil, err
 	}
+	doObscure, _ := in.GetBool("obscure")
+	noObscure, _ := in.GetBool("noObscure")
 	switch what {
 	case "create":
 		remoteType, err := in.GetString("type")
 		if err != nil {
 			return nil, err
 		}
-		return nil, CreateRemote(name, remoteType, parameters)
+		return nil, CreateRemote(ctx, name, remoteType, parameters, doObscure, noObscure)
 	case "update":
-		return nil, UpdateRemote(name, parameters)
+		return nil, UpdateRemote(ctx, name, parameters, doObscure, noObscure)
 	case "password":
-		return nil, PasswordRemote(name, parameters)
+		return nil, PasswordRemote(ctx, name, parameters)
 	}
 	panic("unknown rcConfig type")
 }

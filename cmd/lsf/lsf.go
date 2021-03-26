@@ -44,7 +44,7 @@ func init() {
 
 var commandDefinition = &cobra.Command{
 	Use:   "lsf remote:path",
-	Short: `List directories and objects in remote:path formatted for parsing`,
+	Short: `List directories and objects in remote:path formatted for parsing.`,
 	Long: `
 List the contents of the source path (directories and objects) to
 standard output in a form which is easy to parse by scripts.  By
@@ -72,7 +72,7 @@ output:
     o - Original ID of underlying object
     m - MimeType of object if known
     e - encrypted name
-    T - tier of storage if known, eg "Hot" or "Cool"
+    T - tier of storage if known, e.g. "Hot" or "Cool"
 
 So if you wanted the path, size and modification time, you would use
 --format "pst", or maybe --format "tsp" to put the path last.
@@ -132,13 +132,13 @@ Eg
     "this file contains a comma, in the file name.txt",6
 
 Note that the --absolute parameter is useful for making lists of files
-to pass to an rclone copy with the --files-from flag.
+to pass to an rclone copy with the --files-from-raw flag.
 
 For example to find all the files modified within one day and copy
 those only (without traversing the whole directory structure):
 
     rclone lsf --absolute --files-only --max-age 1d /path/to/local > new_files
-    rclone copy --files-from new_files /path/to/local remote:path
+    rclone copy --files-from-raw new_files /path/to/local remote:path
 
 ` + lshelp.Help,
 	Run: func(command *cobra.Command, args []string) {
@@ -166,10 +166,11 @@ func Lsf(ctx context.Context, fsrc fs.Fs, out io.Writer) error {
 	list.SetDirSlash(dirSlash)
 	list.SetAbsolute(absolute)
 	var opt = operations.ListJSONOpt{
-		NoModTime: true,
-		DirsOnly:  dirsOnly,
-		FilesOnly: filesOnly,
-		Recurse:   recurse,
+		NoModTime:  true,
+		NoMimeType: true,
+		DirsOnly:   dirsOnly,
+		FilesOnly:  filesOnly,
+		Recurse:    recurse,
 	}
 
 	for _, char := range format {
@@ -184,10 +185,12 @@ func Lsf(ctx context.Context, fsrc fs.Fs, out io.Writer) error {
 		case 'h':
 			list.AddHash(hashType)
 			opt.ShowHash = true
+			opt.HashTypes = []string{hashType.String()}
 		case 'i':
 			list.AddID()
 		case 'm':
 			list.AddMimeType()
+			opt.NoMimeType = false
 		case 'e':
 			list.AddEncrypted()
 			opt.ShowEncrypted = true

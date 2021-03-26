@@ -36,6 +36,9 @@ use it like this
 	rclone cryptdecode encryptedremote: encryptedfilename1 encryptedfilename2
 
 	rclone cryptdecode --reverse encryptedremote: filename1 filename2
+
+Another way to accomplish this is by using the ` + "`rclone backend encode` (or `decode`)" + `command.
+See the documentation on the ` + "`crypt`" + ` overlay for more info.
 `,
 	Run: func(command *cobra.Command, args []string) {
 		cmd.CheckArgs(2, 11, command, args)
@@ -60,7 +63,7 @@ use it like this
 }
 
 // cryptDecode returns the unencrypted file name
-func cryptDecode(cipher crypt.Cipher, args []string) error {
+func cryptDecode(cipher *crypt.Cipher, args []string) error {
 	output := ""
 
 	for _, encryptedFileName := range args {
@@ -78,7 +81,7 @@ func cryptDecode(cipher crypt.Cipher, args []string) error {
 }
 
 // cryptEncode returns the encrypted file name
-func cryptEncode(cipher crypt.Cipher, args []string) error {
+func cryptEncode(cipher *crypt.Cipher, args []string) error {
 	output := ""
 
 	for _, fileName := range args {

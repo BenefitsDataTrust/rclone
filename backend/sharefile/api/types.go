@@ -95,14 +95,14 @@ type UploadSpecification struct {
 	ChunkURI           string `json:"ChunkUri"`           // Specifies the URI the client must send the file data to
 	FinishURI          string `json:"FinishUri"`          // If provided, specifies the final call the client must perform to finish the upload process
 	ProgressData       string `json:"ProgressData"`       // Allows the client to check progress of standard uploads
-	IsResume           bool   `json:"IsResume"`           // Specifies a Resumable upload is supproted.
+	IsResume           bool   `json:"IsResume"`           // Specifies a Resumable upload is supported.
 	ResumeIndex        int64  `json:"ResumeIndex"`        // Specifies the initial index for resuming, if IsResume is true.
 	ResumeOffset       int64  `json:"ResumeOffset"`       // Specifies the initial file offset by bytes, if IsResume is true
 	ResumeFileHash     string `json:"ResumeFileHash"`     // Specifies the MD5 hash of the first ResumeOffset bytes of the partial file found at the server
 	MaxNumberOfThreads int    `json:"MaxNumberOfThreads"` // Specifies the max number of chunks that can be sent simultaneously for threaded uploads
 }
 
-// UploadFinishResponse is returnes from calling UploadSpecification.FinishURI
+// UploadFinishResponse is returns from calling UploadSpecification.FinishURI
 type UploadFinishResponse struct {
 	Error        bool   `json:"error"`
 	ErrorMessage string `json:"errorMessage"`

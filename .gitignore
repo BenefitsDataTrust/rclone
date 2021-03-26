@@ -1,6 +1,7 @@
 *~
 _junk/
 rclone
+rclone.exe
 build
 docs/public
 rclone.iml
@@ -8,3 +9,5 @@ rclone.iml
 .history
 *.test
 *.log
+*.iml
+fuzz-build.zip

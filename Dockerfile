@@ -3,9 +3,8 @@ FROM golang AS builder
 COPY . /go/src/github.com/rclone/rclone/
 WORKDIR /go/src/github.com/rclone/rclone/
 
-RUN make quicktest
 RUN \
-  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+  CGO_ENABLED=0 \
   make
 RUN ./rclone version
 
@@ -23,6 +22,8 @@ RUN apk add --update python \
 RUN curl -sSL https://sdk.cloud.google.com | bash
 
 COPY --from=builder /go/src/github.com/rclone/rclone/rclone /usr/local/bin/
+
+RUN addgroup -g 1009 rclone && adduser -u 1009 -Ds /bin/sh -G rclone rclone
 
 ENTRYPOINT [ "rclone" ]
 

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configflags"
 	"github.com/rclone/rclone/fs/filter/filterflags"
+	"github.com/rclone/rclone/fs/log/logflags"
 	"github.com/rclone/rclone/fs/rc/rcflags"
 	"github.com/rclone/rclone/lib/atexit"
 	"github.com/spf13/cobra"
@@ -46,10 +48,11 @@ __rclone_custom_func() {
         else
             __rclone_init_completion -n : || return
         fi
+	local rclone=(command rclone --ask-password=false)
         if [[ $cur != *:* ]]; then
             local ifs=$IFS
             IFS=$'\n'
-            local remotes=($(command rclone listremotes))
+            local remotes=($("${rclone[@]}" listremotes 2> /dev/null))
             IFS=$ifs
             local remote
             for remote in "${remotes[@]}"; do
@@ -68,7 +71,7 @@ __rclone_custom_func() {
             fi
             local ifs=$IFS
             IFS=$'\n'
-            local lines=($(rclone lsf "${cur%%:*}:$prefix" 2>/dev/null))
+            local lines=($("${rclone[@]}" lsf "${cur%%:*}:$prefix" 2> /dev/null))
             IFS=$ifs
             local line
             for line in "${lines[@]}"; do
@@ -164,10 +167,12 @@ func runRoot(cmd *cobra.Command, args []string) {
 //
 // Helpful example: http://rtfcode.com/xref/moby-17.03.2-ce/cli/cobra.go
 func setupRootCommand(rootCmd *cobra.Command) {
+	ci := fs.GetConfig(context.Background())
 	// Add global flags
-	configflags.AddFlags(pflag.CommandLine)
+	configflags.AddFlags(ci, pflag.CommandLine)
 	filterflags.AddFlags(pflag.CommandLine)
 	rcflags.AddFlags(pflag.CommandLine)
+	logflags.AddFlags(pflag.CommandLine)
 
 	Root.Run = runRoot
 	Root.Flags().BoolVarP(&version, "version", "V", false, "Print the version number")
@@ -242,7 +247,6 @@ Use "rclone help backends" for a list of supported services.
 var docFlagsTemplate = `---
 title: "Global Flags"
 description: "Rclone Global Flags"
-date: "YYYY-MM-DD"
 ---
 
 # Global Flags
@@ -295,7 +299,7 @@ func showBackend(name string) {
 	var standardOptions, advancedOptions fs.Options
 	done := map[string]struct{}{}
 	for _, opt := range backend.Options {
-		// Skip if done already (eg with Provider options)
+		// Skip if done already (e.g. with Provider options)
 		if _, doneAlready := done[opt.Name]; doneAlready {
 			continue
 		}
@@ -322,6 +326,9 @@ func showBackend(name string) {
 			}
 			fmt.Printf("#### --%s%s\n\n", opt.FlagName(backend.Prefix), shortOpt)
 			fmt.Printf("%s\n\n", opt.Help)
+			if opt.IsPassword {
+				fmt.Printf("**NB** Input to this must be obscured - see [rclone obscure](/commands/rclone_obscure/).\n\n")
+			}
 			fmt.Printf("- Config:      %s\n", opt.Name)
 			fmt.Printf("- Env Var:     %s\n", opt.EnvVarName(backend.Prefix))
 			fmt.Printf("- Type:        %s\n", opt.Type())

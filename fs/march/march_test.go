@@ -19,6 +19,7 @@ import (
 	"github.com/rclone/rclone/fstest/mockobject"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/text/unicode/norm"
 )
 
 // Some times used in the tests
@@ -192,6 +193,7 @@ func TestMarch(t *testing.T) {
 				cancel:     cancel,
 				noTraverse: false,
 			}
+			fi := filter.GetConfig(ctx)
 			m := &March{
 				Ctx:           ctx,
 				Fdst:          r.Fremote,
@@ -199,15 +201,15 @@ func TestMarch(t *testing.T) {
 				Dir:           "",
 				NoTraverse:    mt.noTraverse,
 				Callback:      mt,
-				DstIncludeAll: filter.Active.Opt.DeleteExcluded,
+				DstIncludeAll: fi.Opt.DeleteExcluded,
 			}
 
-			mt.processError(m.Run())
+			mt.processError(m.Run(ctx))
 			mt.cancel()
 			err := mt.currentError()
 			require.NoError(t, err)
 
-			precision := fs.GetModifyWindow(r.Fremote, r.Flocal)
+			precision := fs.GetModifyWindow(ctx, r.Fremote, r.Flocal)
 			fstest.CompareItems(t, mt.srcOnly, srcOnly, test.dirSrcOnly, precision, "srcOnly")
 			fstest.CompareItems(t, mt.dstOnly, dstOnly, test.dirDstOnly, precision, "dstOnly")
 			fstest.CompareItems(t, mt.match, match, test.dirMatch, precision, "match")
@@ -259,6 +261,7 @@ func TestMarchNoTraverse(t *testing.T) {
 				cancel:     cancel,
 				noTraverse: true,
 			}
+			fi := filter.GetConfig(ctx)
 			m := &March{
 				Ctx:           ctx,
 				Fdst:          r.Fremote,
@@ -266,15 +269,15 @@ func TestMarchNoTraverse(t *testing.T) {
 				Dir:           "",
 				NoTraverse:    mt.noTraverse,
 				Callback:      mt,
-				DstIncludeAll: filter.Active.Opt.DeleteExcluded,
+				DstIncludeAll: fi.Opt.DeleteExcluded,
 			}
 
-			mt.processError(m.Run())
+			mt.processError(m.Run(ctx))
 			mt.cancel()
 			err := mt.currentError()
 			require.NoError(t, err)
 
-			precision := fs.GetModifyWindow(r.Fremote, r.Flocal)
+			precision := fs.GetModifyWindow(ctx, r.Fremote, r.Flocal)
 			fstest.CompareItems(t, mt.srcOnly, srcOnly, test.dirSrcOnly, precision, "srcOnly")
 			fstest.CompareItems(t, mt.match, match, test.dirMatch, precision, "match")
 		})
@@ -313,6 +316,8 @@ func TestMatchListings(t *testing.T) {
 		b    = mockobject.Object("b")
 		c    = mockobject.Object("c")
 		d    = mockobject.Object("d")
+		uE1  = mockobject.Object("é") // one of the unicode E characters
+		uE2  = mockobject.Object("é")  // a different unicode E character
 		dirA = mockdir.New("A")
 		dirb = mockdir.New("b")
 	)
@@ -418,6 +423,28 @@ func TestMatchListings(t *testing.T) {
 				{A, A},
 			},
 			transforms: []matchTransformFn{strings.ToLower},
+		},
+		{
+			what: "Unicode near-duplicate that becomes duplicate with normalization",
+			input: fs.DirEntries{
+				uE1, uE1,
+				uE2, uE2,
+			},
+			matches: []matchPair{
+				{uE1, uE1},
+			},
+			transforms: []matchTransformFn{norm.NFC.String},
+		},
+		{
+			what: "Unicode near-duplicate with no normalization",
+			input: fs.DirEntries{
+				uE1, uE1,
+				uE2, uE2,
+			},
+			matches: []matchPair{
+				{uE1, uE1},
+				{uE2, uE2},
+			},
 		},
 		{
 			what: "File and directory are not duplicates - srcOnly",

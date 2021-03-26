@@ -48,7 +48,7 @@ type SuccessResponseBody struct {
 	Token   string    `xml:"RequestSecurityTokenResponse>RequestedSecurityToken>BinarySecurityToken"`
 }
 
-// SharepointError holds a error response microsoft login
+// SharepointError holds an error response microsoft login
 type SharepointError struct {
 	XMLName xml.Name          `xml:"Envelope"`
 	Body    ErrorResponseBody `xml:"Body"`
@@ -58,7 +58,7 @@ func (e *SharepointError) Error() string {
 	return fmt.Sprintf("%s: %s (%s)", e.Body.FaultCode, e.Body.Reason, e.Body.Detail)
 }
 
-// ErrorResponseBody contains the body of a erroneous repsonse
+// ErrorResponseBody contains the body of an erroneous response
 type ErrorResponseBody struct {
 	XMLName   xml.Name
 	FaultCode string `xml:"Fault>Code>Subcode>Value"`
@@ -176,13 +176,12 @@ func (ca *CookieAuth) getSPToken(ctx context.Context) (conf *SharepointSuccessRe
 
 	// Create and execute the first request which returns an auth token for the sharepoint service
 	// With this token we can authenticate on the login page and save the returned cookies
-	req, err := http.NewRequest("POST", "https://login.microsoftonline.com/extSTS.srf", buf)
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://login.microsoftonline.com/extSTS.srf", buf)
 	if err != nil {
 		return nil, err
 	}
-	req = req.WithContext(ctx) // go1.13 can use NewRequestWithContext
 
-	client := fshttp.NewClient(fs.Config)
+	client := fshttp.NewClient(ctx)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, errors.Wrap(err, "Error while logging in to endpoint")

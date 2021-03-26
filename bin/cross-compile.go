@@ -5,6 +5,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -20,52 +21,67 @@ import (
 	"sync"
 	"text/template"
 	"time"
+
+	"github.com/coreos/go-semver/semver"
 )
 
 var (
 	// Flags
-	debug       = flag.Bool("d", false, "Print commands instead of running them.")
-	parallel    = flag.Int("parallel", runtime.NumCPU(), "Number of commands to run in parallel.")
-	copyAs      = flag.String("release", "", "Make copies of the releases with this name")
-	gitLog      = flag.String("git-log", "", "git log to include as well")
-	include     = flag.String("include", "^.*$", "os/arch regexp to include")
-	exclude     = flag.String("exclude", "^$", "os/arch regexp to exclude")
-	cgo         = flag.Bool("cgo", false, "Use cgo for the build")
-	noClean     = flag.Bool("no-clean", false, "Don't clean the build directory before running.")
-	tags        = flag.String("tags", "", "Space separated list of build tags")
-	compileOnly = flag.Bool("compile-only", false, "Just build the binary, not the zip.")
+	debug           = flag.Bool("d", false, "Print commands instead of running them.")
+	parallel        = flag.Int("parallel", runtime.NumCPU(), "Number of commands to run in parallel.")
+	copyAs          = flag.String("release", "", "Make copies of the releases with this name")
+	gitLog          = flag.String("git-log", "", "git log to include as well")
+	include         = flag.String("include", "^.*$", "os/arch regexp to include")
+	exclude         = flag.String("exclude", "^$", "os/arch regexp to exclude")
+	cgo             = flag.Bool("cgo", false, "Use cgo for the build")
+	noClean         = flag.Bool("no-clean", false, "Don't clean the build directory before running.")
+	tags            = flag.String("tags", "", "Space separated list of build tags")
+	buildmode       = flag.String("buildmode", "", "Passed to go build -buildmode flag")
+	compileOnly     = flag.Bool("compile-only", false, "Just build the binary, not the zip.")
+	extraEnv        = flag.String("env", "", "comma separated list of VAR=VALUE env vars to set")
+	macOSSDK        = flag.String("macos-sdk", "", "macOS SDK to use")
+	macOSArch       = flag.String("macos-arch", "", "macOS arch to use")
+	extraCgoCFlags  = flag.String("cgo-cflags", "", "extra CGO_CFLAGS")
+	extraCgoLdFlags = flag.String("cgo-ldflags", "", "extra CGO_LDFLAGS")
 )
 
 // GOOS/GOARCH pairs we build for
+//
+// If the GOARCH contains a - it is a synthetic arch with more parameters
 var osarches = []string{
 	"windows/386",
 	"windows/amd64",
-	"darwin/386",
 	"darwin/amd64",
+	"darwin/arm64",
 	"linux/386",
 	"linux/amd64",
 	"linux/arm",
+	"linux/arm-v7",
 	"linux/arm64",
 	"linux/mips",
 	"linux/mipsle",
 	"freebsd/386",
 	"freebsd/amd64",
 	"freebsd/arm",
+	"freebsd/arm-v7",
 	"netbsd/386",
 	"netbsd/amd64",
 	"netbsd/arm",
+	"netbsd/arm-v7",
 	"openbsd/386",
 	"openbsd/amd64",
 	"plan9/386",
 	"plan9/amd64",
 	"solaris/amd64",
+	"js/wasm",
 }
 
 // Special environment flags for a given arch
 var archFlags = map[string][]string{
-	"386":    {"GO386=387"},
+	"386":    {"GO386=softfloat"},
 	"mips":   {"GOMIPS=softfloat"},
 	"mipsle": {"GOMIPS=softfloat"},
+	"arm-v7": {"GOARM=7"},
 }
 
 // runEnv - run a shell command with env
@@ -168,12 +184,127 @@ func buildDebAndRpm(dir, version, goarch string) []string {
 	return artifacts
 }
 
+// generate system object (syso) file to be picked up by a following go build for embedding icon and version info resources into windows executable
+func buildWindowsResourceSyso(goarch string, versionTag string) string {
+	type M map[string]interface{}
+	version := strings.TrimPrefix(versionTag, "v")
+	semanticVersion := semver.New(version)
+
+	// Build json input to goversioninfo utility
+	bs, err := json.Marshal(M{
+		"FixedFileInfo": M{
+			"FileVersion": M{
+				"Major": semanticVersion.Major,
+				"Minor": semanticVersion.Minor,
+				"Patch": semanticVersion.Patch,
+			},
+			"ProductVersion": M{
+				"Major": semanticVersion.Major,
+				"Minor": semanticVersion.Minor,
+				"Patch": semanticVersion.Patch,
+			},
+		},
+		"StringFileInfo": M{
+			"CompanyName":      "https://rclone.org",
+			"ProductName":      "Rclone",
+			"FileDescription":  "Rsync for cloud storage",
+			"InternalName":     "rclone",
+			"OriginalFilename": "rclone.exe",
+			"LegalCopyright":   "The Rclone Authors",
+			"FileVersion":      version,
+			"ProductVersion":   version,
+		},
+		"IconPath": "../graphics/logo/ico/logo_symbol_color.ico",
+	})
+	if err != nil {
+		log.Printf("Failed to build version info json: %v", err)
+		return ""
+	}
+
+	// Write json to temporary file that will only be used by the goversioninfo command executed below.
+	jsonPath, err := filepath.Abs("versioninfo_windows_" + goarch + ".json") // Appending goos and goarch as suffix to avoid any race conditions
+	if err != nil {
+		log.Printf("Failed to resolve path: %v", err)
+		return ""
+	}
+	err = ioutil.WriteFile(jsonPath, bs, 0644)
+	if err != nil {
+		log.Printf("Failed to write %s: %v", jsonPath, err)
+		return ""
+	}
+	defer func() {
+		if err := os.Remove(jsonPath); err != nil {
+			if !os.IsNotExist(err) {
+				log.Printf("Warning: Couldn't remove generated %s: %v. Please remove it manually.", jsonPath, err)
+			}
+		}
+	}()
+
+	// Execute goversioninfo utility using the json file as input.
+	// It will produce a system object (syso) file that a following go build should pick up.
+	sysoPath, err := filepath.Abs("../resource_windows_" + goarch + ".syso") // Appending goos and goarch as suffix to avoid any race conditions, and also it is recognized by go build and avoids any builds for other systems considering it
+	if err != nil {
+		log.Printf("Failed to resolve path: %v", err)
+		return ""
+	}
+	args := []string{
+		"goversioninfo",
+		"-o",
+		sysoPath,
+	}
+	if goarch == "amd64" {
+		args = append(args, "-64") // Make the syso a 64-bit coff file
+	}
+	args = append(args, jsonPath)
+	err = runEnv(args, nil)
+	if err != nil {
+		return ""
+	}
+
+	return sysoPath
+}
+
+// delete generated system object (syso) resource file
+func cleanupResourceSyso(sysoFilePath string) {
+	if sysoFilePath == "" {
+		return
+	}
+	if err := os.Remove(sysoFilePath); err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("Warning: Couldn't remove generated %s: %v. Please remove it manually.", sysoFilePath, err)
+		}
+	}
+}
+
+// Trip a version suffix off the arch if present
+func stripVersion(goarch string) string {
+	i := strings.Index(goarch, "-")
+	if i < 0 {
+		return goarch
+	}
+	return goarch[:i]
+}
+
+// run the command returning trimmed output
+func runOut(command ...string) string {
+	out, err := exec.Command(command[0], command[1:]...).Output()
+	if err != nil {
+		log.Fatalf("Failed to run %q: %v", command, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // build the binary in dir returning success or failure
 func compileArch(version, goos, goarch, dir string) bool {
-	log.Printf("Compiling %s/%s", goos, goarch)
+	log.Printf("Compiling %s/%s into %s", goos, goarch, dir)
 	output := filepath.Join(dir, "rclone")
 	if goos == "windows" {
 		output += ".exe"
+		sysoPath := buildWindowsResourceSyso(goarch, version)
+		if sysoPath == "" {
+			log.Printf("Warning: Windows binaries will not have file information embedded")
+		}
+		defer cleanupResourceSyso(sysoPath)
 	}
 	err := os.MkdirAll(dir, 0777)
 	if err != nil {
@@ -182,14 +313,50 @@ func compileArch(version, goos, goarch, dir string) bool {
 	args := []string{
 		"go", "build",
 		"--ldflags", "-s -X github.com/rclone/rclone/fs.Version=" + version,
-		"-i",
+		"-trimpath",
 		"-o", output,
 		"-tags", *tags,
-		"..",
 	}
+	if *buildmode != "" {
+		args = append(args,
+			"-buildmode", *buildmode,
+		)
+	}
+	args = append(args,
+		"..",
+	)
 	env := []string{
 		"GOOS=" + goos,
-		"GOARCH=" + goarch,
+		"GOARCH=" + stripVersion(goarch),
+	}
+	if *extraEnv != "" {
+		env = append(env, strings.Split(*extraEnv, ",")...)
+	}
+	var (
+		cgoCFlags  []string
+		cgoLdFlags []string
+	)
+	if *macOSSDK != "" {
+		flag := "-isysroot " + runOut("xcrun", "--sdk", *macOSSDK, "--show-sdk-path")
+		cgoCFlags = append(cgoCFlags, flag)
+		cgoLdFlags = append(cgoLdFlags, flag)
+	}
+	if *macOSArch != "" {
+		flag := "-arch " + *macOSArch
+		cgoCFlags = append(cgoCFlags, flag)
+		cgoLdFlags = append(cgoLdFlags, flag)
+	}
+	if *extraCgoCFlags != "" {
+		cgoCFlags = append(cgoCFlags, *extraCgoCFlags)
+	}
+	if *extraCgoLdFlags != "" {
+		cgoLdFlags = append(cgoLdFlags, *extraCgoLdFlags)
+	}
+	if len(cgoCFlags) > 0 {
+		env = append(env, "CGO_CFLAGS="+strings.Join(cgoCFlags, " "))
+	}
+	if len(cgoLdFlags) > 0 {
+		env = append(env, "CGO_LDFLAGS="+strings.Join(cgoLdFlags, " "))
 	}
 	if !*cgo {
 		env = append(env, "CGO_ENABLED=0")
@@ -205,14 +372,16 @@ func compileArch(version, goos, goarch, dir string) bool {
 		return false
 	}
 	if !*compileOnly {
-		artifacts := []string{buildZip(dir)}
-		// build a .deb and .rpm if appropriate
-		if goos == "linux" {
-			artifacts = append(artifacts, buildDebAndRpm(dir, version, goarch)...)
-		}
-		if *copyAs != "" {
-			for _, artifact := range artifacts {
-				run("ln", artifact, strings.Replace(artifact, "-"+version, "-"+*copyAs, 1))
+		if goos != "js" {
+			artifacts := []string{buildZip(dir)}
+			// build a .deb and .rpm if appropriate
+			if goos == "linux" {
+				artifacts = append(artifacts, buildDebAndRpm(dir, version, stripVersion(goarch))...)
+			}
+			if *copyAs != "" {
+				for _, artifact := range artifacts {
+					run("ln", artifact, strings.Replace(artifact, "-"+version, "-"+*copyAs, 1))
+				}
 			}
 		}
 		// tidy up

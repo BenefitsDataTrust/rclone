@@ -1,10 +1,9 @@
 ---
 title: "Chunker"
 description: "Split-chunking overlay remote"
-date: "2019-08-30"
 ---
 
-<i class="fa fa-cut"></i>Chunker (BETA)
+{{< icon "fa fa-cut" >}}Chunker (BETA)
 ----------------------------------------
 
 The `chunker` overlay transparently splits large files into smaller chunks
@@ -18,7 +17,7 @@ a remote.
 
 First check your chosen remote is working - we'll call it `remote:path` here.
 Note that anything inside `remote:path` will be chunked and anything outside
-won't. This means that if you are using a bucket based remote (eg S3, B2, swift)
+won't. This means that if you are using a bucket based remote (e.g. S3, B2, swift)
 then you should probably put the bucket in the remote `s3:bucket`.
 
 Now configure `chunker` using `rclone config`. We will call this one `overlay`
@@ -39,7 +38,7 @@ XX / Transparently chunk/split large files
 [snip]
 Storage> chunker
 Remote to chunk/unchunk.
-Normally should contain a ':' and a path, eg "myremote:path/to/dir",
+Normally should contain a ':' and a path, e.g. "myremote:path/to/dir",
 "myremote:bucket" or maybe "myremote:" (not recommended).
 Enter a string value. Press Enter for the default ("").
 remote> remote:path
@@ -106,7 +105,7 @@ When upload completes, temporary chunk files are finally renamed.
 This scheme guarantees that operations can be run in parallel and look
 from outside as atomic.
 A similar method with hidden temporary chunks is used for other operations
-(copy/move/rename etc). If an operation fails, hidden chunks are normally
+(copy/move/rename, etc.). If an operation fails, hidden chunks are normally
 destroyed, and the target composite file stays intact.
 
 When a composite file download is requested, chunker transparently
@@ -119,7 +118,7 @@ the potential chunk files are accounted for, grouped and assembled into
 composite directory entries. Any temporary chunks are hidden.
 
 List and other commands can sometimes come across composite files with
-missing or invalid chunks, eg. shadowed by like-named directory or
+missing or invalid chunks, e.g. shadowed by like-named directory or
 another file. This usually means that wrapped file system has been directly
 tampered with or damaged. If chunker detects a missing chunk it will
 by default print warning, skip the whole incomplete group of chunks but
@@ -130,10 +129,10 @@ error message in such cases.
 
 #### Chunk names
 
-The default chunk name format is `*.rclone-chunk.###`, hence by default
-chunk names are `BIG_FILE_NAME.rclone-chunk.001`,
-`BIG_FILE_NAME.rclone-chunk.002` etc. You can configure a different name
-format using the `--chunker-name-format` option. The format uses asterisk
+The default chunk name format is `*.rclone_chunk.###`, hence by default
+chunk names are `BIG_FILE_NAME.rclone_chunk.001`,
+`BIG_FILE_NAME.rclone_chunk.002` etc. You can configure another name format
+using the `name_format` configuration file option. The format uses asterisk
 `*` as a placeholder for the base file name and one or more consecutive
 hash characters `#` as a placeholder for sequential chunk number.
 There must be one and only one asterisk. The number of consecutive hash
@@ -141,7 +140,7 @@ characters defines the minimum length of a string representing a chunk number.
 If decimal chunk number has less digits than the number of hashes, it is
 left-padded by zeros. If the decimal string is longer, it is left intact.
 By default numbering starts from 1 but there is another option that allows
-user to start from 0, eg. for compatibility with legacy software.
+user to start from 0, e.g. for compatibility with legacy software.
 
 For example, if name format is `big_*-##.part` and original file name is
 `data.txt` and numbering starts from 0, then the first chunk will be named
@@ -151,6 +150,9 @@ and the 302nd chunk will become `big_data.txt-301.part`.
 Note that `list` assembles composite directory entries only when chunk names
 match the configured format and treats non-conforming file names as normal
 non-chunked files.
+
+When using `norename` transactions, chunk names will additionally have a unique
+file version suffix. For example, `BIG_FILE_NAME.rclone_chunk.001_bp562k`.
 
 
 ### Metadata
@@ -171,6 +173,7 @@ for composite files. Meta objects carry the following fields:
 - `nchunks` - number of data chunks in file
 - `md5`     - MD5 hashsum of composite file (if present)
 - `sha1`    - SHA1 hashsum (if present)
+- `txn`     - identifies current version of the file
 
 There is no field for composite file name as it's simply equal to the name
 of meta object on the wrapped remote. Please refer to respective sections
@@ -211,6 +214,9 @@ file hashing, configure chunker with `md5all` or `sha1all`. These two modes
 guarantee given hash for all files. If wrapped remote doesn't support it,
 chunker will then add metadata to all files, even small. However, this can
 double the amount of small files in storage and incur additional service charges.
+You can even use chunker to force md5/sha1 support in any other remote
+at expense of sidecar meta objects by setting e.g. `chunk_type=sha1all`
+to force hashsums and `chunk_size=1P` to effectively disable chunking.
 
 Normally, when a file is copied to chunker controlled remote, chunker
 will ask the file source for compatible file hash and revert to on-the-fly
@@ -240,15 +246,15 @@ use modification time of the first data chunk.
 
 ### Migrations
 
-The idiomatic way to migrate to a different chunk size, hash type or
-chunk naming scheme is to:
+The idiomatic way to migrate to a different chunk size, hash type, transaction
+style or chunk naming scheme is to:
 
 - Collect all your chunked files under a directory and have your
   chunker remote point to it.
 - Create another directory (most probably on the same cloud storage)
   and configure a new remote with desired metadata format,
   hash type, chunk naming etc.
-- Now run `rclone sync oldchunks: newchunks:` and all your data
+- Now run `rclone sync -i oldchunks: newchunks:` and all your data
   will be transparently converted in transfer.
   This may take some time, yet chunker will try server-side
   copy if possible.
@@ -269,10 +275,18 @@ remove everything including garbage.
 
 ### Caveats and Limitations
 
-Chunker requires wrapped remote to support server side `move` (or `copy` +
+Chunker requires wrapped remote to support server-side `move` (or `copy` +
 `delete`) operations, otherwise it will explicitly refuse to start.
 This is because it internally renames temporary chunk files to their final
 names when an operation completes successfully.
+
+Chunker encodes chunk number in file name, so with default `name_format`
+setting it adds 17 characters. Also chunker adds 7 characters of temporary
+suffix during operations. Many file systems limit base file name without path
+by 255 characters. Using rclone's crypt remote as a base file system limits
+file name by 143 characters. Thus, maximum name length is 231 for most files
+and 119 for chunker-over-crypt. A user in need can change name format to
+e.g. `*.rcc##` and save 10 characters (provided at most 99 chunks per file).
 
 Note that a move implemented using the copy-and-delete method may incur
 double charging with some cloud storage providers.
@@ -282,15 +296,20 @@ Chunker will not automatically rename existing chunks when you run
 Beware that in result of this some files which have been treated as chunks
 before the change can pop up in directory listings as normal files
 and vice versa. The same warning holds for the chunk size.
-If you desperately need to change critical chunking setings, you should
+If you desperately need to change critical chunking settings, you should
 run data migration as described above.
 
 If wrapped remote is case insensitive, the chunker overlay will inherit
 that property (so you can't have a file called "Hello.doc" and "hello.doc"
 in the same directory).
 
+Chunker included in rclone releases up to `v1.54` can sometimes fail to
+detect metadata produced by recent versions of rclone. We recommend users
+to keep rclone up-to-date to avoid data corruption.
 
-<!--- autogenerated options start - DO NOT EDIT, instead edit fs.RegInfo in backend/chunker/chunker.go then run make backenddocs -->
+Changing `transactions` is dangerous and requires explicit migration.
+
+{{< rem autogenerated options start" - DO NOT EDIT - instead edit fs.RegInfo in backend/chunker/chunker.go then run make backenddocs" >}}
 ### Standard Options
 
 Here are the standard options specific to chunker (Transparently chunk/split large files).
@@ -298,7 +317,7 @@ Here are the standard options specific to chunker (Transparently chunk/split lar
 #### --chunker-remote
 
 Remote to chunk/unchunk.
-Normally should contain a ':' and a path, eg "myremote:path/to/dir",
+Normally should contain a ':' and a path, e.g. "myremote:path/to/dir",
 "myremote:bucket" or maybe "myremote:" (not recommended).
 
 - Config:      remote
@@ -397,4 +416,4 @@ Choose how chunker should handle files with missing or invalid chunks.
     - "false"
         - Warn user, skip incomplete file and proceed.
 
-<!--- autogenerated options stop -->
+{{< rem autogenerated options stop >}}

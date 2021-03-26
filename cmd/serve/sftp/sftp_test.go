@@ -8,6 +8,7 @@
 package sftp
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -17,7 +18,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/obscure"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -44,8 +45,8 @@ func TestSftp(t *testing.T) {
 		opt.User = testUser
 		opt.Pass = testPass
 
-		w := newServer(f, &opt)
-		assert.NoError(t, w.serve())
+		w := newServer(context.Background(), f, &opt)
+		require.NoError(t, w.serve())
 
 		// Read the host and port we started on
 		addr := w.Addr()

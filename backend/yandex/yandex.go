@@ -20,17 +20,15 @@ import (
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/config/obscure"
-	"github.com/rclone/rclone/fs/encodings"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/readers"
 	"github.com/rclone/rclone/lib/rest"
 	"golang.org/x/oauth2"
 )
-
-const enc = encodings.Yandex
 
 //oAuth
 const (
@@ -62,43 +60,41 @@ func init() {
 		Name:        "yandex",
 		Description: "Yandex Disk",
 		NewFs:       NewFs,
-		Config: func(name string, m configmap.Mapper) {
-			err := oauthutil.Config("yandex", name, m, oauthConfig)
+		Config: func(ctx context.Context, name string, m configmap.Mapper) {
+			err := oauthutil.Config(ctx, "yandex", name, m, oauthConfig, nil)
 			if err != nil {
 				log.Fatalf("Failed to configure token: %v", err)
 				return
 			}
 		},
-		Options: []fs.Option{{
-			Name: config.ConfigClientID,
-			Help: "Yandex Client Id\nLeave blank normally.",
-		}, {
-			Name: config.ConfigClientSecret,
-			Help: "Yandex Client Secret\nLeave blank normally.",
-		}, {
-			Name:     "unlink",
-			Help:     "Remove existing public link to file/folder with link command rather than creating.\nDefault is false, meaning link command will create or retrieve public link.",
-			Default:  false,
+		Options: append(oauthutil.SharedOptions, []fs.Option{{
+			Name:     config.ConfigEncoding,
+			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
-		}},
+			// Of the control characters \t \n \r are allowed
+			// it doesn't seem worth making an exception for this
+			Default: (encoder.Display |
+				encoder.EncodeInvalidUtf8),
+		}}...),
 	})
 }
 
 // Options defines the configuration for this backend
 type Options struct {
-	Token  string `config:"token"`
-	Unlink bool   `config:"unlink"`
+	Token string               `config:"token"`
+	Enc   encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote yandex
 type Fs struct {
 	name     string
-	root     string       // root path
-	opt      Options      // parsed options
-	features *fs.Features // optional features
-	srv      *rest.Client // the connection to the yandex server
-	pacer    *fs.Pacer    // pacer for API calls
-	diskRoot string       // root path with "disk:/" container name
+	root     string         // root path
+	opt      Options        // parsed options
+	ci       *fs.ConfigInfo // global config
+	features *fs.Features   // optional features
+	srv      *rest.Client   // the connection to the yandex server
+	pacer    *fs.Pacer      // pacer for API calls
+	diskRoot string         // root path with "disk:/" container name
 }
 
 // Object describes a swift object
@@ -157,7 +153,10 @@ var retryErrorCodes = []int{
 
 // shouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
-func shouldRetry(resp *http.Response, err error) (bool, error) {
+func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
@@ -193,12 +192,12 @@ func (f *Fs) setRoot(root string) {
 	f.diskRoot = diskRoot
 }
 
-// filePath returns a escaped file path (f.root, file)
+// filePath returns an escaped file path (f.root, file)
 func (f *Fs) filePath(file string) string {
 	return path.Join(f.diskRoot, file)
 }
 
-// dirPath returns a escaped file path (f.root, file) ending with '/'
+// dirPath returns an escaped file path (f.root, file) ending with '/'
 func (f *Fs) dirPath(file string) string {
 	return path.Join(f.diskRoot, file) + "/"
 }
@@ -210,7 +209,7 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string, options *api.
 		Parameters: url.Values{},
 	}
 
-	opts.Parameters.Set("path", enc.FromStandardPath(path))
+	opts.Parameters.Set("path", f.opt.Enc.FromStandardPath(path))
 
 	if options.SortMode != nil {
 		opts.Parameters.Set("sort", options.SortMode.String())
@@ -230,20 +229,19 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string, options *api.
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 
 	if err != nil {
 		return nil, err
 	}
 
-	info.Name = enc.ToStandardName(info.Name)
+	info.Name = f.opt.Enc.ToStandardName(info.Name)
 	return &info, nil
 }
 
 // NewFs constructs an Fs from the path, container:path
-func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
-	ctx := context.TODO()
+func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
@@ -266,23 +264,25 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		}
 		log.Printf("Automatically upgraded OAuth config.")
 	}
-	oAuthClient, _, err := oauthutil.NewClient(name, m, oauthConfig)
+	oAuthClient, _, err := oauthutil.NewClient(ctx, name, m, oauthConfig)
 	if err != nil {
 		log.Fatalf("Failed to configure Yandex: %v", err)
 	}
 
+	ci := fs.GetConfig(ctx)
 	f := &Fs{
 		name:  name,
 		opt:   *opt,
+		ci:    ci,
 		srv:   rest.NewClient(oAuthClient).SetRoot(rootURL),
-		pacer: fs.NewPacer(pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 	f.setRoot(root)
 	f.features = (&fs.Features{
 		ReadMimeType:            true,
-		WriteMimeType:           true,
+		WriteMimeType:           false, // Yandex ignores the mime type we send
 		CanHaveEmptyDirectories: true,
-	}).Fill(f)
+	}).Fill(ctx, f)
 	f.srv.SetErrorHandler(errorHandler)
 
 	// Check to see if the object exists and is a file
@@ -364,7 +364,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		if info.ResourceType == "dir" {
 			//list all subdirs
 			for _, element := range info.Embedded.Items {
-				element.Name = enc.ToStandardName(element.Name)
+				element.Name = f.opt.Enc.ToStandardName(element.Name)
 				remote := path.Join(dir, element.Name)
 				entry, err := f.itemToDirEntry(ctx, remote, &element)
 				if err != nil {
@@ -467,11 +467,11 @@ func (f *Fs) CreateDir(ctx context.Context, path string) (err error) {
 	if strings.IndexRune(path, ':') >= 0 {
 		path = "disk:" + path
 	}
-	opts.Parameters.Set("path", enc.FromStandardPath(path))
+	opts.Parameters.Set("path", f.opt.Enc.FromStandardPath(path))
 
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.Call(ctx, &opts)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		// fmt.Printf("CreateDir %q Error: %s\n", path, err.Error())
@@ -495,7 +495,7 @@ func (f *Fs) mkDirs(ctx context.Context, path string) (err error) {
 
 	if err = f.CreateDir(ctx, dirString); err != nil {
 		if apiErr, ok := err.(*api.ErrorResponse); ok {
-			// allready exists
+			// already exists
 			if apiErr.ErrorName != "DiskPathPointsToExistentDirectoryError" {
 				// 2 if it fails then create all directories in the path from root.
 				dirs := strings.Split(dirString, "/") //path separator
@@ -540,12 +540,15 @@ func (f *Fs) waitForJob(ctx context.Context, location string) (err error) {
 		RootURL: location,
 		Method:  "GET",
 	}
-	deadline := time.Now().Add(fs.Config.Timeout)
+	deadline := time.Now().Add(f.ci.TimeoutOrInfinite())
 	for time.Now().Before(deadline) {
 		var resp *http.Response
 		var body []byte
 		err = f.pacer.Call(func() (bool, error) {
 			resp, err = f.srv.Call(ctx, &opts)
+			if fserrors.ContextError(ctx, &err) {
+				return false, err
+			}
 			if err != nil {
 				return fserrors.ShouldRetry(err), err
 			}
@@ -571,7 +574,7 @@ func (f *Fs) waitForJob(ctx context.Context, location string) (err error) {
 
 		time.Sleep(1 * time.Second)
 	}
-	return errors.Errorf("async operation didn't complete after %v", fs.Config.Timeout)
+	return errors.Errorf("async operation didn't complete after %v", f.ci.TimeoutOrInfinite())
 }
 
 func (f *Fs) delete(ctx context.Context, path string, hardDelete bool) (err error) {
@@ -581,13 +584,16 @@ func (f *Fs) delete(ctx context.Context, path string, hardDelete bool) (err erro
 		Parameters: url.Values{},
 	}
 
-	opts.Parameters.Set("path", enc.FromStandardPath(path))
+	opts.Parameters.Set("path", f.opt.Enc.FromStandardPath(path))
 	opts.Parameters.Set("permanently", strconv.FormatBool(hardDelete))
 
 	var resp *http.Response
 	var body []byte
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.Call(ctx, &opts)
+		if fserrors.ContextError(ctx, &err) {
+			return false, err
+		}
 		if err != nil {
 			return fserrors.ShouldRetry(err), err
 		}
@@ -636,13 +642,13 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	return f.purgeCheck(ctx, dir, true)
 }
 
-// Purge deletes all the files and the container
+// Purge deletes all the files in the directory
 //
 // Optional interface: Only implement this if you have a way of
 // deleting all the files quicker than just running Remove() on the
 // result of List()
-func (f *Fs) Purge(ctx context.Context) error {
-	return f.purgeCheck(ctx, "", false)
+func (f *Fs) Purge(ctx context.Context, dir string) error {
+	return f.purgeCheck(ctx, dir, false)
 }
 
 // copyOrMoves copies or moves directories or files depending on the method parameter
@@ -653,14 +659,17 @@ func (f *Fs) copyOrMove(ctx context.Context, method, src, dst string, overwrite 
 		Parameters: url.Values{},
 	}
 
-	opts.Parameters.Set("from", enc.FromStandardPath(src))
-	opts.Parameters.Set("path", enc.FromStandardPath(dst))
+	opts.Parameters.Set("from", f.opt.Enc.FromStandardPath(src))
+	opts.Parameters.Set("path", f.opt.Enc.FromStandardPath(dst))
 	opts.Parameters.Set("overwrite", strconv.FormatBool(overwrite))
 
 	var resp *http.Response
 	var body []byte
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.Call(ctx, &opts)
+		if fserrors.ContextError(ctx, &err) {
+			return false, err
+		}
 		if err != nil {
 			return fserrors.ShouldRetry(err), err
 		}
@@ -683,7 +692,7 @@ func (f *Fs) copyOrMove(ctx context.Context, method, src, dst string, overwrite 
 	return nil
 }
 
-// Copy src to this remote using server side copy operations.
+// Copy src to this remote using server-side copy operations.
 //
 // This is stored with the remote path given
 //
@@ -713,7 +722,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	return f.NewObject(ctx, remote)
 }
 
-// Move src to this remote using server side move operations.
+// Move src to this remote using server-side move operations.
 //
 // This is stored with the remote path given
 //
@@ -744,7 +753,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 }
 
 // DirMove moves src, srcRemote to this remote at dstRemote
-// using server side move operations.
+// using server-side move operations.
 //
 // Will only be called if src.Fs().Name() == f.Name()
 //
@@ -794,26 +803,26 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 }
 
 // PublicLink generates a public link to the remote path (usually readable by anyone)
-func (f *Fs) PublicLink(ctx context.Context, remote string) (link string, err error) {
+func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (link string, err error) {
 	var path string
-	if f.opt.Unlink {
+	if unlink {
 		path = "/resources/unpublish"
 	} else {
 		path = "/resources/publish"
 	}
 	opts := rest.Opts{
 		Method:     "PUT",
-		Path:       enc.FromStandardPath(path),
+		Path:       f.opt.Enc.FromStandardPath(path),
 		Parameters: url.Values{},
 		NoResponse: true,
 	}
 
-	opts.Parameters.Set("path", enc.FromStandardPath(f.filePath(remote)))
+	opts.Parameters.Set("path", f.opt.Enc.FromStandardPath(f.filePath(remote)))
 
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.Call(ctx, &opts)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 
 	if apiErr, ok := err.(*api.ErrorResponse); ok {
@@ -823,7 +832,7 @@ func (f *Fs) PublicLink(ctx context.Context, remote string) (link string, err er
 		}
 	}
 	if err != nil {
-		if f.opt.Unlink {
+		if unlink {
 			return "", errors.Wrap(err, "couldn't remove public link")
 		}
 		return "", errors.Wrap(err, "couldn't create public link")
@@ -851,7 +860,7 @@ func (f *Fs) CleanUp(ctx context.Context) (err error) {
 
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.Call(ctx, &opts)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	return err
 }
@@ -868,7 +877,7 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 	var err error
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 
 	if err != nil {
@@ -994,7 +1003,7 @@ func (o *Object) setCustomProperty(ctx context.Context, property string, value s
 		NoResponse: true,
 	}
 
-	opts.Parameters.Set("path", enc.FromStandardPath(o.filePath()))
+	opts.Parameters.Set("path", o.fs.opt.Enc.FromStandardPath(o.filePath()))
 	rcm := map[string]interface{}{
 		property: value,
 	}
@@ -1002,7 +1011,7 @@ func (o *Object) setCustomProperty(ctx context.Context, property string, value s
 
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, &cpr, nil)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	return err
 }
@@ -1031,11 +1040,11 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		Parameters: url.Values{},
 	}
 
-	opts.Parameters.Set("path", enc.FromStandardPath(o.filePath()))
+	opts.Parameters.Set("path", o.fs.opt.Enc.FromStandardPath(o.filePath()))
 
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &dl)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 
 	if err != nil {
@@ -1050,7 +1059,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	}
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.Call(ctx, &opts)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -1058,7 +1067,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	return resp.Body, err
 }
 
-func (o *Object) upload(ctx context.Context, in io.Reader, overwrite bool, mimeType string) (err error) {
+func (o *Object) upload(ctx context.Context, in io.Reader, overwrite bool, mimeType string, options ...fs.OpenOption) (err error) {
 	// prepare upload
 	var resp *http.Response
 	var ur api.AsyncInfo
@@ -1066,14 +1075,15 @@ func (o *Object) upload(ctx context.Context, in io.Reader, overwrite bool, mimeT
 		Method:     "GET",
 		Path:       "/resources/upload",
 		Parameters: url.Values{},
+		Options:    options,
 	}
 
-	opts.Parameters.Set("path", enc.FromStandardPath(o.filePath()))
+	opts.Parameters.Set("path", o.fs.opt.Enc.FromStandardPath(o.filePath()))
 	opts.Parameters.Set("overwrite", strconv.FormatBool(overwrite))
 
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &ur)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 
 	if err != nil {
@@ -1091,7 +1101,7 @@ func (o *Object) upload(ctx context.Context, in io.Reader, overwrite bool, mimeT
 
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.Call(ctx, &opts)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 
 	return err
@@ -1114,7 +1124,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 
 	//upload file
-	err = o.upload(ctx, in1, true, fs.MimeType(ctx, src))
+	err = o.upload(ctx, in1, true, fs.MimeType(ctx, src), options...)
 	if err != nil {
 		return err
 	}

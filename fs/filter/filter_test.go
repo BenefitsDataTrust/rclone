@@ -65,6 +65,29 @@ func TestNewFilterForbiddenMixOfFilesFromAndFilterRule(t *testing.T) {
 	require.Contains(t, err.Error(), "The usage of --files-from overrides all other filters")
 }
 
+func TestNewFilterForbiddenMixOfFilesFromRawAndFilterRule(t *testing.T) {
+	Opt := DefaultOpt
+
+	// Set up the input
+	Opt.FilterRule = []string{"- filter1", "- filter1b"}
+	Opt.FilesFromRaw = []string{testFile(t, "#comment\nfiles1\nfiles2\n")}
+
+	rm := func(p string) {
+		err := os.Remove(p)
+		if err != nil {
+			t.Logf("error removing %q: %v", p, err)
+		}
+	}
+	// Reset the input
+	defer func() {
+		rm(Opt.FilesFromRaw[0])
+	}()
+
+	_, err := NewFilter(&Opt)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "The usage of --files-from-raw overrides all other filters")
+}
+
 func TestNewFilterWithFilesFromAlone(t *testing.T) {
 	Opt := DefaultOpt
 
@@ -86,6 +109,34 @@ func TestNewFilterWithFilesFromAlone(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, f.files, 2)
 	for _, name := range []string{"files1", "files2"} {
+		_, ok := f.files[name]
+		if !ok {
+			t.Errorf("Didn't find file %q in f.files", name)
+		}
+	}
+}
+
+func TestNewFilterWithFilesFromRaw(t *testing.T) {
+	Opt := DefaultOpt
+
+	// Set up the input
+	Opt.FilesFromRaw = []string{testFile(t, "#comment\nfiles1\nfiles2\n")}
+
+	rm := func(p string) {
+		err := os.Remove(p)
+		if err != nil {
+			t.Logf("error removing %q: %v", p, err)
+		}
+	}
+	// Reset the input
+	defer func() {
+		rm(Opt.FilesFromRaw[0])
+	}()
+
+	f, err := NewFilter(&Opt)
+	require.NoError(t, err)
+	assert.Len(t, f.files, 3)
+	for _, name := range []string{"#comment", "files1", "files2"} {
 		_, ok := f.files[name]
 		if !ok {
 			t.Errorf("Didn't find file %q in f.files", name)
@@ -475,6 +526,21 @@ func TestFilterAddDirRuleOrFileRule(t *testing.T) {
 		},
 		{
 			false,
+			"potato/",
+			`--- File filter rules ---
+- (^|/)potato/.*$
+--- Directory filter rules ---
+- (^|/)potato/.*$`,
+		},
+		{
+			true,
+			"potato/",
+			`--- File filter rules ---
+--- Directory filter rules ---
++ (^|/)potato/$`,
+		},
+		{
+			false,
 			"*",
 			`--- File filter rules ---
 - (^|/)[^/]*$
@@ -517,7 +583,7 @@ func TestFilterAddDirRuleOrFileRule(t *testing.T) {
 	}
 }
 
-func TestFilterForEachLine(t *testing.T) {
+func testFilterForEachLine(t *testing.T, useStdin, raw bool) {
 	file := testFile(t, `; comment
 one
 # another comment
@@ -534,12 +600,45 @@ five
 		require.NoError(t, err)
 	}()
 	lines := []string{}
-	err := forEachLine(file, func(s string) error {
+	fileName := file
+	if useStdin {
+		in, err := os.Open(file)
+		require.NoError(t, err)
+		oldStdin := os.Stdin
+		os.Stdin = in
+		defer func() {
+			os.Stdin = oldStdin
+			_ = in.Close()
+		}()
+		fileName = "-"
+	}
+	err := forEachLine(fileName, raw, func(s string) error {
 		lines = append(lines, s)
 		return nil
 	})
 	require.NoError(t, err)
-	assert.Equal(t, "one,two,three,four,five,six", strings.Join(lines, ","))
+	if raw {
+		assert.Equal(t, "; comment,one,# another comment,,,two, # indented comment,three  ,four    ,five,  six  ",
+			strings.Join(lines, ","))
+	} else {
+		assert.Equal(t, "one,two,three,four,five,six", strings.Join(lines, ","))
+	}
+}
+
+func TestFilterForEachLine(t *testing.T) {
+	testFilterForEachLine(t, false, false)
+}
+
+func TestFilterForEachLineStdin(t *testing.T) {
+	testFilterForEachLine(t, true, false)
+}
+
+func TestFilterForEachLineWithRaw(t *testing.T) {
+	testFilterForEachLine(t, false, true)
+}
+
+func TestFilterForEachLineStdinWithRaw(t *testing.T) {
+	testFilterForEachLine(t, true, true)
 }
 
 func TestFilterMatchesFromDocs(t *testing.T) {
@@ -668,4 +767,31 @@ func TestNewFilterUsesDirectoryFilters(t *testing.T) {
 		got := f.UsesDirectoryFilters()
 		assert.Equal(t, test.want, got, fmt.Sprintf("%s: %s", what, f.DumpFilters()))
 	}
+}
+
+func TestGetConfig(t *testing.T) {
+	ctx := context.Background()
+
+	// Check nil
+	config := GetConfig(nil)
+	assert.Equal(t, globalConfig, config)
+
+	// Check empty config
+	config = GetConfig(ctx)
+	assert.Equal(t, globalConfig, config)
+
+	// Check adding a config
+	ctx2, config2 := AddConfig(ctx)
+	require.NoError(t, config2.AddRule("+ *.jpg"))
+	assert.NotEqual(t, config2, config)
+
+	// Check can get config back
+	config2ctx := GetConfig(ctx2)
+	assert.Equal(t, config2, config2ctx)
+
+	// Check ReplaceConfig
+	f, err := NewFilter(nil)
+	require.NoError(t, err)
+	ctx3 := ReplaceConfig(ctx, f)
+	assert.Equal(t, globalConfig, GetConfig(ctx3))
 }

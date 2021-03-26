@@ -4,14 +4,15 @@ package sftp
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/subtle"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -33,20 +34,22 @@ type server struct {
 	f        fs.Fs
 	opt      Options
 	vfs      *vfs.VFS
+	ctx      context.Context // for global config
 	config   *ssh.ServerConfig
 	listener net.Listener
 	waitChan chan struct{} // for waiting on the listener to close
 	proxy    *proxy.Proxy
 }
 
-func newServer(f fs.Fs, opt *Options) *server {
+func newServer(ctx context.Context, f fs.Fs, opt *Options) *server {
 	s := &server{
 		f:        f,
+		ctx:      ctx,
 		opt:      *opt,
 		waitChan: make(chan struct{}),
 	}
 	if proxyflags.Opt.AuthProxy != "" {
-		s.proxy = proxy.New(&proxyflags.Opt)
+		s.proxy = proxy.New(ctx, &proxyflags.Opt)
 	} else {
 		s.vfs = vfs.New(f, &vfsflags.Opt)
 	}
@@ -75,6 +78,39 @@ func (s *server) getVFS(what string, sshConn *ssh.ServerConn) (VFS *vfs.VFS) {
 	return VFS
 }
 
+// Accept a single connection - run in a go routine as the ssh
+// authentication can block
+func (s *server) acceptConnection(nConn net.Conn) {
+	what := describeConn(nConn)
+
+	// Before use, a handshake must be performed on the incoming net.Conn.
+	sshConn, chans, reqs, err := ssh.NewServerConn(nConn, s.config)
+	if err != nil {
+		fs.Errorf(what, "SSH login failed: %v", err)
+		return
+	}
+
+	fs.Infof(what, "SSH login from %s using %s", sshConn.User(), sshConn.ClientVersion())
+
+	// Discard all global out-of-band Requests
+	go ssh.DiscardRequests(reqs)
+
+	c := &conn{
+		what: what,
+		vfs:  s.getVFS(what, sshConn),
+	}
+	if c.vfs == nil {
+		fs.Infof(what, "Closing unauthenticated connection (couldn't find VFS)")
+		_ = nConn.Close()
+		return
+	}
+	c.handlers = newVFSHandler(c.vfs)
+
+	// Accept all channels
+	go c.handleChannels(chans)
+}
+
+// Accept connections and call them in a go routine
 func (s *server) acceptConnections() {
 	for {
 		nConn, err := s.listener.Accept()
@@ -85,33 +121,7 @@ func (s *server) acceptConnections() {
 			fs.Errorf(nil, "Failed to accept incoming connection: %v", err)
 			continue
 		}
-		what := describeConn(nConn)
-
-		// Before use, a handshake must be performed on the incoming net.Conn.
-		sshConn, chans, reqs, err := ssh.NewServerConn(nConn, s.config)
-		if err != nil {
-			fs.Errorf(what, "SSH login failed: %v", err)
-			continue
-		}
-
-		fs.Infof(what, "SSH login from %s using %s", sshConn.User(), sshConn.ClientVersion())
-
-		// Discard all global out-of-band Requests
-		go ssh.DiscardRequests(reqs)
-
-		c := &conn{
-			what: what,
-			vfs:  s.getVFS(what, sshConn),
-		}
-		if c.vfs == nil {
-			fs.Infof(what, "Closing unauthenticated connection (couldn't find VFS)")
-			_ = nConn.Close()
-			continue
-		}
-		c.handlers = newVFSHandler(c.vfs)
-
-		// Accept all channels
-		go c.handleChannels(chans)
+		go s.acceptConnection(nConn)
 	}
 }
 
@@ -119,8 +129,13 @@ func (s *server) acceptConnections() {
 func (s *server) serve() (err error) {
 	var authorizedKeysMap map[string]struct{}
 
+	// ensure the user isn't trying to use conflicting flags
+	if proxyflags.Opt.AuthProxy != "" && s.opt.AuthorizedKeys != "" && s.opt.AuthorizedKeys != DefaultOpt.AuthorizedKeys {
+		return errors.New("--auth-proxy and --authorized-keys cannot be used at the same time")
+	}
+
 	// Load the authorized keys
-	if s.opt.AuthorizedKeys != "" {
+	if s.opt.AuthorizedKeys != "" && proxyflags.Opt.AuthProxy == "" {
 		authKeysFile := env.ShellExpand(s.opt.AuthorizedKeys)
 		authorizedKeysMap, err = loadAuthorizedKeys(authKeysFile)
 		// If user set the flag away from the default then report an error
@@ -137,12 +152,12 @@ func (s *server) serve() (err error) {
 	// An SSH server is represented by a ServerConfig, which holds
 	// certificate details and handles authentication of ServerConns.
 	s.config = &ssh.ServerConfig{
-		ServerVersion: "SSH-2.0-" + fs.Config.UserAgent,
+		ServerVersion: "SSH-2.0-" + fs.GetConfig(s.ctx).UserAgent,
 		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
 			fs.Debugf(describeConn(c), "Password login attempt for %s", c.User())
 			if s.proxy != nil {
 				// query the proxy for the config
-				_, vfsKey, err := s.proxy.Call(c.User(), string(pass))
+				_, vfsKey, err := s.proxy.Call(c.User(), string(pass), false)
 				if err != nil {
 					return nil, err
 				}
@@ -164,7 +179,21 @@ func (s *server) serve() (err error) {
 		PublicKeyCallback: func(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
 			fs.Debugf(describeConn(c), "Public key login attempt for %s", c.User())
 			if s.proxy != nil {
-				return nil, errors.New("public key login not allowed when using auth proxy")
+				//query the proxy for the config
+				_, vfsKey, err := s.proxy.Call(
+					c.User(),
+					base64.StdEncoding.EncodeToString(pubKey.Marshal()),
+					true,
+				)
+				if err != nil {
+					return nil, err
+				}
+				// just return the Key so we can get it back from the cache
+				return &ssh.Permissions{
+					Extensions: map[string]string{
+						"_vfsKey": vfsKey,
+					},
+				}, nil
 			}
 			if _, ok := authorizedKeysMap[string(pubKey.Marshal())]; ok {
 				return &ssh.Permissions{
@@ -187,40 +216,42 @@ func (s *server) serve() (err error) {
 	}
 
 	// Load the private key, from the cache if not explicitly configured
-	keyPath := s.opt.Key
+	keyPaths := s.opt.HostKeys
 	cachePath := filepath.Join(config.CacheDir, "serve-sftp")
-	if keyPath == "" {
-		keyPath = filepath.Join(cachePath, "id_rsa")
+	if len(keyPaths) == 0 {
+		keyPaths = []string{filepath.Join(cachePath, "id_rsa")}
 	}
-	private, err := loadPrivateKey(keyPath)
-	if err != nil && s.opt.Key == "" {
-		fs.Debugf(nil, "Failed to load %q: %v", keyPath, err)
-		// If loading a cached key failed, make the keys and retry
-		err = os.MkdirAll(cachePath, 0700)
-		if err != nil {
-			return errors.Wrap(err, "failed to create cache path")
+	for _, keyPath := range keyPaths {
+		private, err := loadPrivateKey(keyPath)
+		if err != nil && len(s.opt.HostKeys) == 0 {
+			fs.Debugf(nil, "Failed to load %q: %v", keyPath, err)
+			// If loading a cached key failed, make the keys and retry
+			err = os.MkdirAll(cachePath, 0700)
+			if err != nil {
+				return errors.Wrap(err, "failed to create cache path")
+			}
+			const bits = 2048
+			fs.Logf(nil, "Generating %d bit key pair at %q", bits, keyPath)
+			err = makeSSHKeyPair(bits, keyPath+".pub", keyPath)
+			if err != nil {
+				return errors.Wrap(err, "failed to create SSH key pair")
+			}
+			// reload the new keys
+			private, err = loadPrivateKey(keyPath)
 		}
-		const bits = 2048
-		fs.Logf(nil, "Generating %d bit key pair at %q", bits, keyPath)
-		err = makeSSHKeyPair(bits, keyPath+".pub", keyPath)
 		if err != nil {
-			return errors.Wrap(err, "failed to create SSH key pair")
+			return err
 		}
-		// reload the new keys
-		private, err = loadPrivateKey(keyPath)
-	}
-	if err != nil {
-		return err
-	}
-	fs.Debugf(nil, "Loaded private key from %q", keyPath)
+		fs.Debugf(nil, "Loaded private key from %q", keyPath)
 
-	s.config.AddHostKey(private)
+		s.config.AddHostKey(private)
+	}
 
 	// Once a ServerConfig has been configured, connections can be
 	// accepted.
 	s.listener, err = net.Listen("tcp", s.opt.ListenAddr)
 	if err != nil {
-		log.Fatal("failed to listen for connection", err)
+		return errors.Wrap(err, "failed to listen for connection")
 	}
 	fs.Logf(nil, "SFTP server listening on %v\n", s.listener.Addr())
 

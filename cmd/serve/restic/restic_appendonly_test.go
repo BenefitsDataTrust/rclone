@@ -1,6 +1,7 @@
 package restic
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"io"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/rclone/rclone/cmd"
 	"github.com/rclone/rclone/cmd/serve/httplib/httpflags"
+	"github.com/rclone/rclone/fs/config/configfile"
 	"github.com/stretchr/testify/require"
 )
 
@@ -63,6 +65,8 @@ func createOverwriteDeleteSeq(t testing.TB, path string) []TestRequest {
 
 // TestResticHandler runs tests on the restic handler code, especially in append-only mode.
 func TestResticHandler(t *testing.T) {
+	ctx := context.Background()
+	configfile.LoadConfig(ctx)
 	buf := make([]byte, 32)
 	_, err := io.ReadFull(rand.Reader, buf)
 	require.NoError(t, err)
@@ -126,10 +130,10 @@ func TestResticHandler(t *testing.T) {
 
 	// make a new file system in the temp dir
 	f := cmd.NewFsSrc([]string{tempdir})
-	srv := newServer(f, &httpflags.Opt)
+	srv := NewServer(f, &httpflags.Opt)
 
 	// create the repo
-	checkRequest(t, srv.handler,
+	checkRequest(t, srv.ServeHTTP,
 		newRequest(t, "POST", "/?create=true", nil),
 		[]wantFunc{wantCode(http.StatusOK)})
 
@@ -137,7 +141,7 @@ func TestResticHandler(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			for i, seq := range test.seq {
 				t.Logf("request %v: %v %v", i, seq.req.Method, seq.req.URL.Path)
-				checkRequest(t, srv.handler, seq.req, seq.want)
+				checkRequest(t, srv.ServeHTTP, seq.req, seq.want)
 			}
 		})
 	}

@@ -28,6 +28,8 @@ func setup(t *testing.T) (*Cache, CreateFunc) {
 			return "/file.txt", true, errCached
 		case "/error":
 			return nil, false, errSentinel
+		case "/err":
+			return nil, false, errSentinel
 		}
 		panic(fmt.Sprintf("Unknown path %q", path))
 	}
@@ -106,18 +108,70 @@ func TestCacheExpire(t *testing.T) {
 
 	c.mu.Lock()
 	entry := c.cache["/"]
-
 	assert.Equal(t, 1, len(c.cache))
 	c.mu.Unlock()
+
 	c.cacheExpire()
+
 	c.mu.Lock()
 	assert.Equal(t, 1, len(c.cache))
 	entry.lastUsed = time.Now().Add(-c.expireDuration - 60*time.Second)
 	assert.Equal(t, true, c.expireRunning)
 	c.mu.Unlock()
+
 	time.Sleep(250 * time.Millisecond)
+
 	c.mu.Lock()
 	assert.Equal(t, false, c.expireRunning)
+	assert.Equal(t, 0, len(c.cache))
+	c.mu.Unlock()
+}
+
+func TestCachePin(t *testing.T) {
+	c, create := setup(t)
+
+	_, err := c.Get("/", create)
+	require.NoError(t, err)
+
+	// Pin a non existent item to show nothing happens
+	c.Pin("notfound")
+
+	c.mu.Lock()
+	entry := c.cache["/"]
+	assert.Equal(t, 1, len(c.cache))
+	c.mu.Unlock()
+
+	c.cacheExpire()
+
+	c.mu.Lock()
+	assert.Equal(t, 1, len(c.cache))
+	c.mu.Unlock()
+
+	// Pin the entry and check it does not get expired
+	c.Pin("/")
+
+	// Reset last used to make the item expirable
+	c.mu.Lock()
+	entry.lastUsed = time.Now().Add(-c.expireDuration - 60*time.Second)
+	c.mu.Unlock()
+
+	c.cacheExpire()
+
+	c.mu.Lock()
+	assert.Equal(t, 1, len(c.cache))
+	c.mu.Unlock()
+
+	// Unpin the entry and check it does get expired now
+	c.Unpin("/")
+
+	// Reset last used
+	c.mu.Lock()
+	entry.lastUsed = time.Now().Add(-c.expireDuration - 60*time.Second)
+	c.mu.Unlock()
+
+	c.cacheExpire()
+
+	c.mu.Lock()
 	assert.Equal(t, 0, len(c.cache))
 	c.mu.Unlock()
 }
@@ -171,4 +225,86 @@ func TestGetMaybe(t *testing.T) {
 	value, found = c.GetMaybe("/")
 	assert.Equal(t, false, found)
 	assert.Nil(t, value)
+}
+
+func TestDelete(t *testing.T) {
+	c, create := setup(t)
+
+	assert.Equal(t, 0, len(c.cache))
+
+	_, err := c.Get("/", create)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, len(c.cache))
+
+	assert.Equal(t, false, c.Delete("notfound"))
+	assert.Equal(t, 1, len(c.cache))
+
+	assert.Equal(t, true, c.Delete("/"))
+	assert.Equal(t, 0, len(c.cache))
+
+	assert.Equal(t, false, c.Delete("/"))
+	assert.Equal(t, 0, len(c.cache))
+}
+
+func TestDeletePrefix(t *testing.T) {
+	create := func(path string) (interface{}, bool, error) {
+		return path, true, nil
+	}
+	c := New()
+
+	_, err := c.Get("remote:path", create)
+	require.NoError(t, err)
+	_, err = c.Get("remote:path2", create)
+	require.NoError(t, err)
+	_, err = c.Get("remote:", create)
+	require.NoError(t, err)
+	_, err = c.Get("remote", create)
+	require.NoError(t, err)
+
+	assert.Equal(t, 4, len(c.cache))
+
+	assert.Equal(t, 3, c.DeletePrefix("remote:"))
+	assert.Equal(t, 1, len(c.cache))
+
+	assert.Equal(t, 1, c.DeletePrefix(""))
+	assert.Equal(t, 0, len(c.cache))
+
+	assert.Equal(t, 0, c.DeletePrefix(""))
+	assert.Equal(t, 0, len(c.cache))
+}
+
+func TestCacheRename(t *testing.T) {
+	c := New()
+	create := func(path string) (interface{}, bool, error) {
+		return path, true, nil
+	}
+
+	existing1, err := c.Get("existing1", create)
+	require.NoError(t, err)
+	_, err = c.Get("existing2", create)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, c.Entries())
+
+	// rename to non existent
+	value, found := c.Rename("existing1", "EXISTING1")
+	assert.Equal(t, true, found)
+	assert.Equal(t, existing1, value)
+
+	assert.Equal(t, 2, c.Entries())
+
+	// rename to existent and check existing value is returned
+	value, found = c.Rename("existing2", "EXISTING1")
+	assert.Equal(t, true, found)
+	assert.Equal(t, existing1, value)
+
+	assert.Equal(t, 1, c.Entries())
+
+	// rename non existent
+	value, found = c.Rename("notfound", "NOTFOUND")
+	assert.Equal(t, false, found)
+	assert.Nil(t, value)
+
+	assert.Equal(t, 1, c.Entries())
 }

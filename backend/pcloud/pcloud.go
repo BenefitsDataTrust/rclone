@@ -26,26 +26,23 @@ import (
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/config/obscure"
-	"github.com/rclone/rclone/fs/encodings"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/dircache"
+	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
 	"golang.org/x/oauth2"
 )
 
-const enc = encodings.Pcloud
-
 const (
 	rcloneClientID              = "DnONSzyJXpm"
 	rcloneEncryptedClientSecret = "ej1OIF39VOQQ0PXaSdK9ztkLw3tdLNscW2157TKNQdQKkICR4uU7aFg4eFM"
 	minSleep                    = 10 * time.Millisecond
 	maxSleep                    = 2 * time.Second
-	decayConstant               = 2    // bigger for slower decay, exponential
-	rootID                      = "d0" // ID of root folder is always this
-	rootURL                     = "https://api.pcloud.com"
+	decayConstant               = 2 // bigger for slower decay, exponential
+	defaultHostname             = "api.pcloud.com"
 )
 
 // Globals
@@ -54,8 +51,8 @@ var (
 	oauthConfig = &oauth2.Config{
 		Scopes: nil,
 		Endpoint: oauth2.Endpoint{
-			AuthURL:  "https://my.pcloud.com/oauth2/authorize",
-			TokenURL: "https://api.pcloud.com/oauth2_token",
+			AuthURL: "https://my.pcloud.com/oauth2/authorize",
+			// TokenURL: "https://api.pcloud.com/oauth2_token", set by updateTokenURL
 		},
 		ClientID:     rcloneClientID,
 		ClientSecret: obscure.MustReveal(rcloneEncryptedClientSecret),
@@ -63,30 +60,90 @@ var (
 	}
 )
 
+// Update the TokenURL with the actual hostname
+func updateTokenURL(oauthConfig *oauth2.Config, hostname string) {
+	oauthConfig.Endpoint.TokenURL = "https://" + hostname + "/oauth2_token"
+}
+
 // Register with Fs
 func init() {
+	updateTokenURL(oauthConfig, defaultHostname)
 	fs.Register(&fs.RegInfo{
 		Name:        "pcloud",
 		Description: "Pcloud",
 		NewFs:       NewFs,
-		Config: func(name string, m configmap.Mapper) {
-			err := oauthutil.Config("pcloud", name, m, oauthConfig)
+		Config: func(ctx context.Context, name string, m configmap.Mapper) {
+			optc := new(Options)
+			err := configstruct.Set(m, optc)
+			if err != nil {
+				fs.Errorf(nil, "Failed to read config: %v", err)
+			}
+			updateTokenURL(oauthConfig, optc.Hostname)
+			checkAuth := func(oauthConfig *oauth2.Config, auth *oauthutil.AuthResult) error {
+				if auth == nil || auth.Form == nil {
+					return errors.New("form not found in response")
+				}
+				hostname := auth.Form.Get("hostname")
+				if hostname == "" {
+					hostname = defaultHostname
+				}
+				// Save the hostname in the config
+				m.Set("hostname", hostname)
+				// Update the token URL
+				updateTokenURL(oauthConfig, hostname)
+				fs.Debugf(nil, "pcloud: got hostname %q", hostname)
+				return nil
+			}
+			opt := oauthutil.Options{
+				CheckAuth:    checkAuth,
+				StateBlankOK: true, // pCloud seems to drop the state parameter now - see #4210
+			}
+			err = oauthutil.Config(ctx, "pcloud", name, m, oauthConfig, &opt)
 			if err != nil {
 				log.Fatalf("Failed to configure token: %v", err)
 			}
 		},
-		Options: []fs.Option{{
-			Name: config.ConfigClientID,
-			Help: "Pcloud App Client Id\nLeave blank normally.",
+		Options: append(oauthutil.SharedOptions, []fs.Option{{
+			Name:     config.ConfigEncoding,
+			Help:     config.ConfigEncodingHelp,
+			Advanced: true,
+			// Encode invalid UTF-8 bytes as json doesn't handle them properly.
+			//
+			// TODO: Investigate Unicode simplification (＼ gets converted to \ server-side)
+			Default: (encoder.Display |
+				encoder.EncodeBackSlash |
+				encoder.EncodeInvalidUtf8),
 		}, {
-			Name: config.ConfigClientSecret,
-			Help: "Pcloud App Client Secret\nLeave blank normally.",
-		}},
+			Name:     "root_folder_id",
+			Help:     "Fill in for rclone to use a non root folder as its starting point.",
+			Default:  "d0",
+			Advanced: true,
+		}, {
+			Name: "hostname",
+			Help: `Hostname to connect to.
+
+This is normally set when rclone initially does the oauth connection,
+however you will need to set it by hand if you are using remote config
+with rclone authorize.
+`,
+			Default:  defaultHostname,
+			Advanced: true,
+			Examples: []fs.OptionExample{{
+				Value: defaultHostname,
+				Help:  "Original/US region",
+			}, {
+				Value: "eapi.pcloud.com",
+				Help:  "EU region",
+			}},
+		}}...),
 	})
 }
 
 // Options defines the configuration for this backend
 type Options struct {
+	Enc          encoder.MultiEncoder `config:"encoding"`
+	RootFolderID string               `config:"root_folder_id"`
+	Hostname     string               `config:"hostname"`
 }
 
 // Fs represents a remote pcloud
@@ -138,7 +195,7 @@ func (f *Fs) Features() *fs.Features {
 	return f.features
 }
 
-// parsePath parses an pcloud 'url'
+// parsePath parses a pcloud 'url'
 func parsePath(path string) (root string) {
 	root = strings.Trim(path, "/")
 	return
@@ -156,13 +213,16 @@ var retryErrorCodes = []int{
 
 // shouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
-func shouldRetry(resp *http.Response, err error) (bool, error) {
+func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
 	doRetry := false
 
 	// Check if it is an api.Error
 	if apiErr, ok := err.(*api.Error); ok {
 		// See https://docs.pcloud.com/errors/ for error treatment
-		// Errors are classified as 1xxx, 2xxx etc
+		// Errors are classified as 1xxx, 2xxx, etc.
 		switch apiErr.Result / 1000 {
 		case 4: // 4xxx: rate limiting
 			doRetry = true
@@ -181,7 +241,7 @@ func shouldRetry(resp *http.Response, err error) (bool, error) {
 // readMetaDataForPath reads the metadata from the path
 func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.Item, err error) {
 	// defer fs.Trace(f, "path=%q", path)("info=%+v, err=%v", &info, &err)
-	leaf, directoryID, err := f.dirCache.FindRootAndPath(ctx, path, false)
+	leaf, directoryID, err := f.dirCache.FindPath(ctx, path, false)
 	if err != nil {
 		if err == fs.ErrorDirNotFound {
 			return nil, fs.ErrorObjectNotFound
@@ -223,8 +283,7 @@ func errorHandler(resp *http.Response) error {
 }
 
 // NewFs constructs an Fs from the path, container:path
-func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
-	ctx := context.Background()
+func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
@@ -232,22 +291,23 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		return nil, err
 	}
 	root = parsePath(root)
-	oAuthClient, ts, err := oauthutil.NewClient(name, m, oauthConfig)
+	oAuthClient, ts, err := oauthutil.NewClient(ctx, name, m, oauthConfig)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to configure Pcloud")
 	}
+	updateTokenURL(oauthConfig, opt.Hostname)
 
 	f := &Fs{
 		name:  name,
 		root:  root,
 		opt:   *opt,
-		srv:   rest.NewClient(oAuthClient).SetRoot(rootURL),
-		pacer: fs.NewPacer(pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		srv:   rest.NewClient(oAuthClient).SetRoot("https://" + opt.Hostname),
+		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 	f.features = (&fs.Features{
 		CaseInsensitive:         false,
 		CanHaveEmptyDirectories: true,
-	}).Fill(f)
+	}).Fill(ctx, f)
 	f.srv.SetErrorHandler(errorHandler)
 
 	// Renew the token in the background
@@ -256,7 +316,8 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 		return err
 	})
 
-	// Get rootID
+	// Get rootFolderID
+	rootID := f.opt.RootFolderID
 	f.dirCache = dircache.New(root, rootID, f)
 
 	// Find the current root
@@ -342,12 +403,12 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 		Path:       "/createfolder",
 		Parameters: url.Values{},
 	}
-	opts.Parameters.Set("name", enc.FromStandardName(leaf))
+	opts.Parameters.Set("name", f.opt.Enc.FromStandardName(leaf))
 	opts.Parameters.Set("folderid", dirIDtoNumber(pathID))
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		//fmt.Printf("...Error %v\n", err)
@@ -402,7 +463,7 @@ func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, fi
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return found, errors.Wrap(err, "couldn't list files")
@@ -418,7 +479,7 @@ func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, fi
 				continue
 			}
 		}
-		item.Name = enc.ToStandardName(item.Name)
+		item.Name = f.opt.Enc.ToStandardName(item.Name)
 		if fn(item) {
 			found = true
 			break
@@ -437,10 +498,6 @@ func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, fi
 // This should return ErrDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	err = f.dirCache.FindRoot(ctx, false)
-	if err != nil {
-		return nil, err
-	}
 	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
 		return nil, err
@@ -481,7 +538,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 // Used to create new objects
 func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time, size int64) (o *Object, leaf string, directoryID string, err error) {
 	// Create the directory for the object if it doesn't exist
-	leaf, directoryID, err = f.dirCache.FindRootAndPath(ctx, remote, true)
+	leaf, directoryID, err = f.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
 		return
 	}
@@ -512,13 +569,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 // Mkdir creates the container if it doesn't exist
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	err := f.dirCache.FindRoot(ctx, true)
-	if err != nil {
-		return err
-	}
-	if dir != "" {
-		_, err = f.dirCache.FindDir(ctx, dir, true)
-	}
+	_, err := f.dirCache.FindDir(ctx, dir, true)
 	return err
 }
 
@@ -530,10 +581,6 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 		return errors.New("can't purge root directory")
 	}
 	dc := f.dirCache
-	err := dc.FindRoot(ctx, false)
-	if err != nil {
-		return err
-	}
 	rootID, err := dc.FindDir(ctx, dir, false)
 	if err != nil {
 		return err
@@ -553,7 +600,7 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return errors.Wrap(err, "rmdir failed")
@@ -577,7 +624,7 @@ func (f *Fs) Precision() time.Duration {
 	return time.Second
 }
 
-// Copy src to this remote using server side copy operations.
+// Copy src to this remote using server-side copy operations.
 //
 // This is stored with the remote path given
 //
@@ -610,7 +657,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		Parameters: url.Values{},
 	}
 	opts.Parameters.Set("fileid", fileIDtoNumber(srcObj.id))
-	opts.Parameters.Set("toname", enc.FromStandardName(leaf))
+	opts.Parameters.Set("toname", f.opt.Enc.FromStandardName(leaf))
 	opts.Parameters.Set("tofolderid", dirIDtoNumber(directoryID))
 	opts.Parameters.Set("mtime", fmt.Sprintf("%d", srcObj.modTime.Unix()))
 	var resp *http.Response
@@ -618,7 +665,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -630,18 +677,18 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	return dstObj, nil
 }
 
-// Purge deletes all the files and the container
+// Purge deletes all the files in the directory
 //
 // Optional interface: Only implement this if you have a way of
 // deleting all the files quicker than just running Remove() on the
 // result of List()
-func (f *Fs) Purge(ctx context.Context) error {
-	return f.purgeCheck(ctx, "", false)
+func (f *Fs) Purge(ctx context.Context, dir string) error {
+	return f.purgeCheck(ctx, dir, false)
 }
 
 // CleanUp empties the trash
 func (f *Fs) CleanUp(ctx context.Context) error {
-	err := f.dirCache.FindRoot(ctx, false)
+	rootID, err := f.dirCache.RootID(ctx, false)
 	if err != nil {
 		return err
 	}
@@ -650,17 +697,17 @@ func (f *Fs) CleanUp(ctx context.Context) error {
 		Path:       "/trash_clear",
 		Parameters: url.Values{},
 	}
-	opts.Parameters.Set("folderid", dirIDtoNumber(f.dirCache.RootID()))
+	opts.Parameters.Set("folderid", dirIDtoNumber(rootID))
 	var resp *http.Response
 	var result api.Error
 	return f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 }
 
-// Move src to this remote using server side move operations.
+// Move src to this remote using server-side move operations.
 //
 // This is stored with the remote path given
 //
@@ -689,14 +736,14 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		Parameters: url.Values{},
 	}
 	opts.Parameters.Set("fileid", fileIDtoNumber(srcObj.id))
-	opts.Parameters.Set("toname", enc.FromStandardName(leaf))
+	opts.Parameters.Set("toname", f.opt.Enc.FromStandardName(leaf))
 	opts.Parameters.Set("tofolderid", dirIDtoNumber(directoryID))
 	var resp *http.Response
 	var result api.ItemResult
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -710,7 +757,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 }
 
 // DirMove moves src, srcRemote to this remote at dstRemote
-// using server side move operations.
+// using server-side move operations.
 //
 // Will only be called if src.Fs().Name() == f.Name()
 //
@@ -723,58 +770,8 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		fs.Debugf(srcFs, "Can't move directory - not same remote type")
 		return fs.ErrorCantDirMove
 	}
-	srcPath := path.Join(srcFs.root, srcRemote)
-	dstPath := path.Join(f.root, dstRemote)
 
-	// Refuse to move to or from the root
-	if srcPath == "" || dstPath == "" {
-		fs.Debugf(src, "DirMove error: Can't move root")
-		return errors.New("can't move root directory")
-	}
-
-	// find the root src directory
-	err := srcFs.dirCache.FindRoot(ctx, false)
-	if err != nil {
-		return err
-	}
-
-	// find the root dst directory
-	if dstRemote != "" {
-		err = f.dirCache.FindRoot(ctx, true)
-		if err != nil {
-			return err
-		}
-	} else {
-		if f.dirCache.FoundRoot() {
-			return fs.ErrorDirExists
-		}
-	}
-
-	// Find ID of dst parent, creating subdirs if necessary
-	var leaf, directoryID string
-	findPath := dstRemote
-	if dstRemote == "" {
-		findPath = f.root
-	}
-	leaf, directoryID, err = f.dirCache.FindPath(ctx, findPath, true)
-	if err != nil {
-		return err
-	}
-
-	// Check destination does not exist
-	if dstRemote != "" {
-		_, err = f.dirCache.FindDir(ctx, dstRemote, false)
-		if err == fs.ErrorDirNotFound {
-			// OK
-		} else if err != nil {
-			return err
-		} else {
-			return fs.ErrorDirExists
-		}
-	}
-
-	// Find ID of src
-	srcID, err := srcFs.dirCache.FindDir(ctx, srcRemote, false)
+	srcID, _, _, dstDirectoryID, dstLeaf, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
 	if err != nil {
 		return err
 	}
@@ -786,14 +783,14 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		Parameters: url.Values{},
 	}
 	opts.Parameters.Set("folderid", dirIDtoNumber(srcID))
-	opts.Parameters.Set("toname", enc.FromStandardName(leaf))
-	opts.Parameters.Set("tofolderid", dirIDtoNumber(directoryID))
+	opts.Parameters.Set("toname", f.opt.Enc.FromStandardName(dstLeaf))
+	opts.Parameters.Set("tofolderid", dirIDtoNumber(dstDirectoryID))
 	var resp *http.Response
 	var result api.ItemResult
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return err
@@ -809,6 +806,61 @@ func (f *Fs) DirCacheFlush() {
 	f.dirCache.ResetRoot()
 }
 
+func (f *Fs) linkDir(ctx context.Context, dirID string, expire fs.Duration) (string, error) {
+	opts := rest.Opts{
+		Method:     "POST",
+		Path:       "/getfolderpublink",
+		Parameters: url.Values{},
+	}
+	var result api.PubLinkResult
+	opts.Parameters.Set("folderid", dirIDtoNumber(dirID))
+	err := f.pacer.Call(func() (bool, error) {
+		resp, err := f.srv.CallJSON(ctx, &opts, nil, &result)
+		err = result.Error.Update(err)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return "", err
+	}
+	return result.Link, err
+}
+
+func (f *Fs) linkFile(ctx context.Context, path string, expire fs.Duration) (string, error) {
+	obj, err := f.NewObject(ctx, path)
+	if err != nil {
+		return "", err
+	}
+	o := obj.(*Object)
+	opts := rest.Opts{
+		Method:     "POST",
+		Path:       "/getfilepublink",
+		Parameters: url.Values{},
+	}
+	var result api.PubLinkResult
+	opts.Parameters.Set("fileid", fileIDtoNumber(o.id))
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err := f.srv.CallJSON(ctx, &opts, nil, &result)
+		err = result.Error.Update(err)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return "", err
+	}
+	return result.Link, nil
+}
+
+// PublicLink adds a "readable by anyone with link" permission on the given file or folder.
+func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (string, error) {
+	dirID, err := f.dirCache.FindDir(ctx, remote, false)
+	if err == fs.ErrorDirNotFound {
+		return f.linkFile(ctx, remote, expire)
+	}
+	if err != nil {
+		return "", err
+	}
+	return f.linkDir(ctx, dirID, expire)
+}
+
 // About gets quota information
 func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 	opts := rest.Opts{
@@ -820,7 +872,7 @@ func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &q)
 		err = q.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "about failed")
@@ -835,6 +887,13 @@ func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 
 // Hashes returns the supported hash sets.
 func (f *Fs) Hashes() hash.Set {
+	// EU region supports SHA1 and SHA256 (but rclone doesn't
+	// support SHA256 yet).
+	//
+	// https://forum.rclone.org/t/pcloud-to-local-no-hashes-in-common/19440
+	if f.opt.Hostname == "eapi.pcloud.com" {
+		return hash.Set(hash.SHA1)
+	}
 	return hash.Set(hash.MD5 | hash.SHA1)
 }
 
@@ -871,7 +930,7 @@ func (o *Object) getHashes(ctx context.Context) (err error) {
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return err
@@ -990,7 +1049,7 @@ func (o *Object) downloadURL(ctx context.Context) (URL string, err error) {
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return "", err
@@ -1016,7 +1075,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	}
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.Call(ctx, &opts)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -1038,7 +1097,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	remote := o.Remote()
 
 	// Create the directory for the object if it doesn't exist
-	leaf, directoryID, err := o.fs.dirCache.FindRootAndPath(ctx, remote, true)
+	leaf, directoryID, err := o.fs.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
 		return err
 	}
@@ -1061,12 +1120,13 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		Method:           "PUT",
 		Path:             "/uploadfile",
 		Body:             in,
-		ContentType:      fs.MimeType(ctx, o),
+		ContentType:      fs.MimeType(ctx, src),
 		ContentLength:    &size,
 		Parameters:       url.Values{},
 		TransferEncoding: []string{"identity"}, // pcloud doesn't like chunked encoding
+		Options:          options,
 	}
-	leaf = enc.FromStandardName(leaf)
+	leaf = o.fs.opt.Enc.FromStandardName(leaf)
 	opts.Parameters.Set("filename", leaf)
 	opts.Parameters.Set("folderid", dirIDtoNumber(directoryID))
 	opts.Parameters.Set("nopartial", "1")
@@ -1074,7 +1134,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 	// Special treatment for a 0 length upload.  This doesn't work
 	// with PUT even with Content-Length set (by setting
-	// opts.Body=0), so upload it as a multpart form POST with
+	// opts.Body=0), so upload it as a multipart form POST with
 	// Content-Length set.
 	if size == 0 {
 		formReader, contentType, overhead, err := rest.MultipartUpload(in, opts.Parameters, "content", leaf)
@@ -1094,7 +1154,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	err = o.fs.pacer.CallNoRetry(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		// sometimes pcloud leaves a half complete file on
@@ -1124,7 +1184,7 @@ func (o *Object) Remove(ctx context.Context) error {
 	return o.fs.pacer.Call(func() (bool, error) {
 		resp, err := o.fs.srv.CallJSON(ctx, &opts, nil, &result)
 		err = result.Error.Update(err)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 }
 
@@ -1142,6 +1202,7 @@ var (
 	_ fs.Mover           = (*Fs)(nil)
 	_ fs.DirMover        = (*Fs)(nil)
 	_ fs.DirCacheFlusher = (*Fs)(nil)
+	_ fs.PublicLinker    = (*Fs)(nil)
 	_ fs.Abouter         = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
 	_ fs.IDer            = (*Object)(nil)

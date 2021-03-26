@@ -2,17 +2,20 @@
 
 Current active maintainers of rclone are:
 
-| Name             | GitHub ID   | Specific Responsibilities    |
-| :--------------- | :---------- | :--------------------------  |
-| Nick Craig-Wood  | @ncw        | overall project health       |
-| Stefan Breunig   | @breunigs   |                              |
-| Ishuah Kariuki   | @ishuah     |                              |
-| Remus Bunduc     | @remusb     | cache backend                |
-| Fabian Möller    | @B4dM4n     |                              |
-| Alex Chen        | @Cnly       | onedrive backend             |
-| Sandeep Ummadi   | @sandeepkru | azureblob backend            |
-| Sebastian Bünger | @buengese   | jottacloud & yandex backends |
-| Ivan Andreev     | @ivandeex   | chunker & mailru backends    |
+| Name             | GitHub ID         | Specific Responsibilities    |
+| :--------------- | :---------------- | :--------------------------  |
+| Nick Craig-Wood  | @ncw              | overall project health       |
+| Stefan Breunig   | @breunigs         |                              |
+| Ishuah Kariuki   | @ishuah           |                              |
+| Remus Bunduc     | @remusb           | cache backend                |
+| Fabian Möller    | @B4dM4n           |                              |
+| Alex Chen        | @Cnly             | onedrive backend             |
+| Sandeep Ummadi   | @sandeepkru       | azureblob backend            |
+| Sebastian Bünger | @buengese         | jottacloud, yandex & compress backends |
+| Ivan Andreev     | @ivandeex         | chunker & mailru backends    |
+| Max Sum          | @Max-Sum          | union backend                |
+| Fred             | @creativeprojects | seafile backend              |
+| Caleb Case       | @calebcase        | tardigrade backend           |
 
 **This is a work in progress Draft**
 
@@ -30,11 +33,11 @@ Rclone uses the labels like this:
 * `duplicate` - normally close these and ask the user to subscribe to the original
 * `enhancement: new remote` - a new rclone backend
 * `enhancement` - a new feature
-* `FUSE` - do do with `rclone mount` command
+* `FUSE` - to do with `rclone mount` command
 * `good first issue` - mark these if you find a small self contained issue - these get shown to new visitors to the project
 * `help` wanted - mark these if you find a self contained issue - these get shown to new visitors to the project
 * `IMPORTANT` - note to maintainers not to forget to fix this for the release
-* `maintenance` - internal enhancement, code re-organisation etc
+* `maintenance` - internal enhancement, code re-organisation, etc.
 * `Needs Go 1.XX` - waiting for that version of Go to be released
 * `question` - not a `bug` or `enhancement` - direct to the forum for next time
 * `Remote: XXX` - which rclone backend this affects
@@ -42,7 +45,7 @@ Rclone uses the labels like this:
 
 If it turns out to be a bug or an enhancement it should be tagged as such, with the appropriate other tags.  Don't forget the "good first issue" tag to give new contributors something easy to do to get going.
 
-When a ticket is tagged it should be added to a milestone, either the next release, the one after, Soon or Help Wanted.  Bugs can be added to the "Known Bugs" milestone if they aren't planned to be fixed or need to wait for something (eg the next go release).
+When a ticket is tagged it should be added to a milestone, either the next release, the one after, Soon or Help Wanted.  Bugs can be added to the "Known Bugs" milestone if they aren't planned to be fixed or need to wait for something (e.g. the next go release).
 
 The milestones have these meanings:
 

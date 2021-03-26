@@ -8,6 +8,7 @@
 package webdav
 
 import (
+	"context"
 	"flag"
 	"io/ioutil"
 	"net/http"
@@ -33,6 +34,7 @@ const (
 	testBindAddress = "localhost:0"
 	testUser        = "user"
 	testPass        = "pass"
+	testTemplate    = "../http/testdata/golden/testindex.html"
 )
 
 // check interfaces
@@ -51,10 +53,11 @@ func TestWebDav(t *testing.T) {
 		opt.ListenAddr = testBindAddress
 		opt.BasicUser = testUser
 		opt.BasicPass = testPass
+		opt.Template = testTemplate
 		hashType = hash.MD5
 
 		// Start the server
-		w := newWebDAV(f, &opt)
+		w := newWebDAV(context.Background(), f, &opt)
 		assert.NoError(t, w.serve())
 
 		// Config for the backend we'll use to connect to the server
@@ -84,19 +87,22 @@ var (
 )
 
 func TestHTTPFunction(t *testing.T) {
+	ctx := context.Background()
 	// exclude files called hidden.txt and directories called hidden
-	require.NoError(t, filter.Active.AddRule("- hidden.txt"))
-	require.NoError(t, filter.Active.AddRule("- hidden/**"))
+	fi := filter.GetConfig(ctx)
+	require.NoError(t, fi.AddRule("- hidden.txt"))
+	require.NoError(t, fi.AddRule("- hidden/**"))
 
 	// Uses the same test files as http tests but with different golden.
-	f, err := fs.NewFs("../http/testdata/files")
+	f, err := fs.NewFs(context.Background(), "../http/testdata/files")
 	assert.NoError(t, err)
 
 	opt := httplib.DefaultOpt
 	opt.ListenAddr = testBindAddress
+	opt.Template = testTemplate
 
 	// Start the server
-	w := newWebDAV(f, &opt)
+	w := newWebDAV(context.Background(), f, &opt)
 	assert.NoError(t, w.serve())
 	defer func() {
 		w.Close()

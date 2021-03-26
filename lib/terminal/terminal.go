@@ -9,7 +9,6 @@ import (
 	"sync"
 
 	colorable "github.com/mattn/go-colorable"
-	"golang.org/x/crypto/ssh/terminal"
 )
 
 // VT100 codes
@@ -61,6 +60,9 @@ const (
 	HiMagentaBg = "\x1b[105m"
 	HiCyanBg    = "\x1b[106m"
 	HiWhiteBg   = "\x1b[107m"
+
+	ChangeTitle = "\033]0;"
+	BEL         = "\007"
 )
 
 var (
@@ -72,7 +74,7 @@ var (
 func Start() {
 	once.Do(func() {
 		f := os.Stdout
-		if !terminal.IsTerminal(int(f.Fd())) {
+		if !IsTerminal(int(f.Fd())) {
 			// If stdout not a tty then remove escape codes
 			Out = colorable.NewNonColorable(f)
 		} else if runtime.GOOS == "windows" && os.Getenv("TERM") != "" {
@@ -89,18 +91,8 @@ func WriteString(s string) {
 	Write([]byte(s))
 }
 
-// GetSize reads the dimensions of the current terminal or returns a
-// sensible default
-func GetSize() (w, h int) {
-	w, h, err := terminal.GetSize(int(os.Stdout.Fd()))
-	if err != nil {
-		w, h = 80, 25
-	}
-	return w, h
-}
-
 // Out is an io.Writer which can be used to write to the terminal
-// eg for use with fmt.Fprintf(terminal.Out, "terminal fun: %d\n", n)
+// e.g. for use with fmt.Fprintf(terminal.Out, "terminal fun: %d\n", n)
 var Out io.Writer
 
 // Write sends out to the VT100 terminal.

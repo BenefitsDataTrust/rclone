@@ -2,6 +2,7 @@
 package restic
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -17,11 +18,12 @@ import (
 	"github.com/rclone/rclone/cmd/serve/httplib/serve"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
+	"github.com/rclone/rclone/fs/config/flags"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fs/walk"
+	"github.com/rclone/rclone/lib/terminal"
 	"github.com/spf13/cobra"
-	"golang.org/x/crypto/ssh/terminal"
 	"golang.org/x/net/http2"
 )
 
@@ -29,13 +31,16 @@ var (
 	stdio        bool
 	appendOnly   bool
 	privateRepos bool
+	cacheObjects bool
 )
 
 func init() {
 	httpflags.AddFlags(Command.Flags())
-	Command.Flags().BoolVar(&stdio, "stdio", false, "run an HTTP2 server on stdin/stdout")
-	Command.Flags().BoolVar(&appendOnly, "append-only", false, "disallow deletion of repository data")
-	Command.Flags().BoolVar(&privateRepos, "private-repos", false, "users can only access their private repo")
+	flagSet := Command.Flags()
+	flags.BoolVarP(flagSet, &stdio, "stdio", "", false, "run an HTTP2 server on stdin/stdout")
+	flags.BoolVarP(flagSet, &appendOnly, "append-only", "", false, "disallow deletion of repository data")
+	flags.BoolVarP(flagSet, &privateRepos, "private-repos", "", false, "users can only access their private repo")
+	flags.BoolVarP(flagSet, &cacheObjects, "cache-objects", "", true, "cache listed objects")
 }
 
 // Command definition for cobra
@@ -74,6 +79,10 @@ By default this will serve on "localhost:8080" you can change this
 with use of the "--addr" flag.
 
 You might wish to start this server on boot.
+
+Adding --cache-objects=false will cause rclone to stop caching objects
+returned from the List call. Caching is normally desirable as it speeds
+up downloading objects, saves transactions and uses very little memory.
 
 ### Setting up restic to use rclone ###
 
@@ -118,13 +127,13 @@ these **must** end with /.  Eg
 #### Private repositories ####
 
 The "--private-repos" flag can be used to limit users to repositories starting
-with a path of "/<username>/".
+with a path of ` + "`/<username>/`" + `.
 ` + httplib.Help,
 	Run: func(command *cobra.Command, args []string) {
 		cmd.CheckArgs(1, 1, command, args)
 		f := cmd.NewFsSrc(args)
 		cmd.Run(false, true, command, func() error {
-			s := newServer(f, &httpflags.Opt)
+			s := NewServer(f, &httpflags.Opt)
 			if stdio {
 				if terminal.IsTerminal(int(os.Stdout.Fd())) {
 					return errors.New("Refusing to run HTTP2 server directly on a terminal, please let restic start rclone")
@@ -137,7 +146,7 @@ with a path of "/<username>/".
 
 				httpSrv := &http2.Server{}
 				opts := &http2.ServeConnOpts{
-					Handler: http.HandlerFunc(s.handler),
+					Handler: s,
 				}
 				httpSrv.ServeConn(conn, opts)
 				return nil
@@ -156,26 +165,29 @@ const (
 	resticAPIV2 = "application/vnd.x.restic.rest.v2"
 )
 
-// server contains everything to run the server
-type server struct {
+// Server contains everything to run the Server
+type Server struct {
 	*httplib.Server
-	f fs.Fs
+	f     fs.Fs
+	cache *cache
 }
 
-func newServer(f fs.Fs, opt *httplib.Options) *server {
+// NewServer returns an HTTP server that speaks the rest protocol
+func NewServer(f fs.Fs, opt *httplib.Options) *Server {
 	mux := http.NewServeMux()
-	s := &server{
+	s := &Server{
 		Server: httplib.NewServer(mux, opt),
 		f:      f,
+		cache:  newCache(),
 	}
-	mux.HandleFunc(s.Opt.BaseURL+"/", s.handler)
+	mux.HandleFunc(s.Opt.BaseURL+"/", s.ServeHTTP)
 	return s
 }
 
 // Serve runs the http server in the background.
 //
 // Use s.Close() and s.Wait() to shutdown server
-func (s *server) Serve() error {
+func (s *Server) Serve() error {
 	err := s.Server.Serve()
 	if err != nil {
 		return err
@@ -203,8 +215,8 @@ func makeRemote(path string) string {
 	return prefix + fileName[:2] + "/" + fileName
 }
 
-// handler reads incoming requests and dispatches them
-func (s *server) handler(w http.ResponseWriter, r *http.Request) {
+// ServeHTTP reads incoming requests and dispatches them
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Server", "rclone/"+fs.Version)
 
@@ -245,9 +257,24 @@ func (s *server) handler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// newObject returns an object with the remote given either from the
+// cache or directly
+func (s *Server) newObject(ctx context.Context, remote string) (fs.Object, error) {
+	o := s.cache.find(remote)
+	if o != nil {
+		return o, nil
+	}
+	o, err := s.f.NewObject(ctx, remote)
+	if err != nil {
+		return o, err
+	}
+	s.cache.add(remote, o)
+	return o, nil
+}
+
 // get the remote
-func (s *server) serveObject(w http.ResponseWriter, r *http.Request, remote string) {
-	o, err := s.f.NewObject(r.Context(), remote)
+func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, remote string) {
+	o, err := s.newObject(r.Context(), remote)
 	if err != nil {
 		fs.Debugf(remote, "%s request error: %v", r.Method, err)
 		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
@@ -257,10 +284,10 @@ func (s *server) serveObject(w http.ResponseWriter, r *http.Request, remote stri
 }
 
 // postObject posts an object to the repository
-func (s *server) postObject(w http.ResponseWriter, r *http.Request, remote string) {
+func (s *Server) postObject(w http.ResponseWriter, r *http.Request, remote string) {
 	if appendOnly {
 		// make sure the file does not exist yet
-		_, err := s.f.NewObject(r.Context(), remote)
+		_, err := s.newObject(r.Context(), remote)
 		if err == nil {
 			fs.Errorf(remote, "Post request: file already exists, refusing to overwrite in append-only mode")
 			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
@@ -269,7 +296,7 @@ func (s *server) postObject(w http.ResponseWriter, r *http.Request, remote strin
 		}
 	}
 
-	_, err := operations.RcatSize(r.Context(), s.f, remote, r.Body, r.ContentLength, time.Now())
+	o, err := operations.RcatSize(r.Context(), s.f, remote, r.Body, r.ContentLength, time.Now())
 	if err != nil {
 		err = accounting.Stats(r.Context()).Error(err)
 		fs.Errorf(remote, "Post request rcat error: %v", err)
@@ -277,10 +304,13 @@ func (s *server) postObject(w http.ResponseWriter, r *http.Request, remote strin
 
 		return
 	}
+
+	// if successfully uploaded add to cache
+	s.cache.add(remote, o)
 }
 
 // delete the remote
-func (s *server) deleteObject(w http.ResponseWriter, r *http.Request, remote string) {
+func (s *Server) deleteObject(w http.ResponseWriter, r *http.Request, remote string) {
 	if appendOnly {
 		parts := strings.Split(r.URL.Path, "/")
 
@@ -291,7 +321,7 @@ func (s *server) deleteObject(w http.ResponseWriter, r *http.Request, remote str
 		}
 	}
 
-	o, err := s.f.NewObject(r.Context(), remote)
+	o, err := s.newObject(r.Context(), remote)
 	if err != nil {
 		fs.Debugf(remote, "Delete request error: %v", err)
 		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
@@ -307,6 +337,9 @@ func (s *server) deleteObject(w http.ResponseWriter, r *http.Request, remote str
 		}
 		return
 	}
+
+	// remove object from cache
+	s.cache.remove(remote)
 }
 
 // listItem is an element returned for the restic v2 list response
@@ -318,18 +351,16 @@ type listItem struct {
 // return type for list
 type listItems []listItem
 
-// add a DirEntry to the listItems
-func (ls *listItems) add(entry fs.DirEntry) {
-	if o, ok := entry.(fs.Object); ok {
-		*ls = append(*ls, listItem{
-			Name: path.Base(o.Remote()),
-			Size: o.Size(),
-		})
-	}
+// add an fs.Object to the listItems
+func (ls *listItems) add(o fs.Object) {
+	*ls = append(*ls, listItem{
+		Name: path.Base(o.Remote()),
+		Size: o.Size(),
+	})
 }
 
 // listObjects lists all Objects of a given type in an arbitrary order.
-func (s *server) listObjects(w http.ResponseWriter, r *http.Request, remote string) {
+func (s *Server) listObjects(w http.ResponseWriter, r *http.Request, remote string) {
 	fs.Debugf(remote, "list request")
 
 	if r.Header.Get("Accept") != resticAPIV2 {
@@ -341,10 +372,16 @@ func (s *server) listObjects(w http.ResponseWriter, r *http.Request, remote stri
 	// make sure an empty list is returned, and not a 'nil' value
 	ls := listItems{}
 
+	// Remove all existing values from the cache
+	s.cache.removePrefix(remote)
+
 	// if remote supports ListR use that directly, otherwise use recursive Walk
 	err := walk.ListR(r.Context(), s.f, remote, true, -1, walk.ListObjects, func(entries fs.DirEntries) error {
 		for _, entry := range entries {
-			ls.add(entry)
+			if o, ok := entry.(fs.Object); ok {
+				ls.add(o)
+				s.cache.add(o.Remote(), o)
+			}
 		}
 		return nil
 	})
@@ -370,7 +407,7 @@ func (s *server) listObjects(w http.ResponseWriter, r *http.Request, remote stri
 // createRepo creates repository directories.
 //
 // We don't bother creating the data dirs as rclone will create them on the fly
-func (s *server) createRepo(w http.ResponseWriter, r *http.Request, remote string) {
+func (s *Server) createRepo(w http.ResponseWriter, r *http.Request, remote string) {
 	fs.Infof(remote, "Creating repository")
 
 	if r.URL.Query().Get("create") != "true" {

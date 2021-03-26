@@ -5,13 +5,12 @@
 package ftp
 
 import (
-	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/user"
-	"runtime"
 	"strconv"
 	"sync"
 
@@ -28,7 +27,7 @@ import (
 	"github.com/rclone/rclone/vfs/vfsflags"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
-	ftp "goftp.io/server"
+	ftp "goftp.io/server/core"
 )
 
 // Options contains options for the http Server
@@ -39,6 +38,8 @@ type Options struct {
 	PassivePorts string // Passive ports range
 	BasicUser    string // single username for basic auth if not using Htpasswd
 	BasicPass    string // password for BasicUser
+	TLSCert      string // TLS PEM key (concatenation of certificate and CA certificate)
+	TLSKey       string // TLS PEM Private key
 }
 
 // DefaultOpt is the default values used for Options
@@ -61,6 +62,8 @@ func AddFlags(flagSet *pflag.FlagSet) {
 	flags.StringVarP(flagSet, &Opt.PassivePorts, "passive-port", "", Opt.PassivePorts, "Passive port range to use.")
 	flags.StringVarP(flagSet, &Opt.BasicUser, "user", "", Opt.BasicUser, "User name for authentication.")
 	flags.StringVarP(flagSet, &Opt.BasicPass, "pass", "", Opt.BasicPass, "Password for authentication. (empty value allow every password)")
+	flags.StringVarP(flagSet, &Opt.TLSCert, "cert", "", Opt.TLSCert, "TLS PEM key (concatenation of certificate and CA certificate)")
+	flags.StringVarP(flagSet, &Opt.TLSKey, "key", "", Opt.TLSKey, "TLS PEM Private key")
 }
 
 func init() {
@@ -81,7 +84,7 @@ or you can make a remote of type ftp to read and write it.
 ### Server options
 
 Use --addr to specify which IP address and port the server should
-listen on, eg --addr 1.2.3.4:8000 or --addr :8080 to listen to all
+listen on, e.g. --addr 1.2.3.4:8000 or --addr :8080 to listen to all
 IPs.  By default it only listens on localhost.  You can use port
 :0 to let the OS choose an available port.
 
@@ -103,7 +106,7 @@ You can set a single username and password with the --user and --pass flags.
 			cmd.CheckArgs(0, 0, command, args)
 		}
 		cmd.Run(false, false, command, func() error {
-			s, err := newServer(f, &Opt)
+			s, err := newServer(context.Background(), f, &Opt)
 			if err != nil {
 				return err
 			}
@@ -114,17 +117,17 @@ You can set a single username and password with the --user and --pass flags.
 
 // server contains everything to run the server
 type server struct {
-	f         fs.Fs
-	srv       *ftp.Server
-	opt       Options
-	vfs       *vfs.VFS
-	proxy     *proxy.Proxy
-	pendingMu sync.Mutex
-	pending   map[string]*Driver // pending Driver~s that haven't got their VFS
+	f      fs.Fs
+	srv    *ftp.Server
+	ctx    context.Context // for global config
+	opt    Options
+	vfs    *vfs.VFS
+	proxy  *proxy.Proxy
+	useTLS bool
 }
 
 // Make a new FTP to serve the remote
-func newServer(f fs.Fs, opt *Options) (*server, error) {
+func newServer(ctx context.Context, f fs.Fs, opt *Options) (*server, error) {
 	host, port, err := net.SplitHostPort(opt.ListenAddr)
 	if err != nil {
 		return nil, errors.New("Failed to parse host:port")
@@ -135,15 +138,16 @@ func newServer(f fs.Fs, opt *Options) (*server, error) {
 	}
 
 	s := &server{
-		f:       f,
-		opt:     *opt,
-		pending: make(map[string]*Driver),
+		f:   f,
+		ctx: ctx,
+		opt: *opt,
 	}
 	if proxyflags.Opt.AuthProxy != "" {
-		s.proxy = proxy.New(&proxyflags.Opt)
+		s.proxy = proxy.New(ctx, &proxyflags.Opt)
 	} else {
 		s.vfs = vfs.New(f, &vfsflags.Opt)
 	}
+	s.useTLS = s.opt.TLSKey != ""
 
 	ftpopt := &ftp.ServerOpts{
 		Name:           "Rclone FTP Server",
@@ -151,10 +155,13 @@ func newServer(f fs.Fs, opt *Options) (*server, error) {
 		Factory:        s, // implemented by NewDriver method
 		Hostname:       host,
 		Port:           portNum,
-		PublicIp:       opt.PublicIP,
+		PublicIP:       opt.PublicIP,
 		PassivePorts:   opt.PassivePorts,
 		Auth:           s, // implemented by CheckPasswd method
 		Logger:         &Logger{},
+		TLS:            s.useTLS,
+		CertFile:       s.opt.TLSCert,
+		KeyFile:        s.opt.TLSKey,
 		//TODO implement a maximum of https://godoc.org/goftp.io/server#ServerOpts
 	}
 	s.srv = ftp.NewServer(ftpopt)
@@ -200,78 +207,13 @@ func (l *Logger) PrintResponse(sessionID string, code int, message string) {
 	fs.Infof(sessionID, "< %d %s", code, message)
 }
 
-// findID finds the connection ID of the calling program.  It does
-// this in an incredibly hacky way by looking in the stack trace.
-//
-// callerName should be the name of the function that we are looking
-// for with a trailing '('
-//
-// What is really needed is a change of calling protocol so
-// CheckPassword is called with the connection.
-func findID(callerName []byte) (string, error) {
-	// Dump the stack in this format
-	// github.com/rclone/rclone/vendor/goftp.io/server.(*Conn).Serve(0xc0000b2680)
-	// 	/home/ncw/go/src/github.com/rclone/rclone/vendor/goftp.io/server/conn.go:116 +0x11d
-	buf := make([]byte, 4096)
-	n := runtime.Stack(buf, false)
-	buf = buf[:n]
-
-	// look for callerName first
-	i := bytes.Index(buf, callerName)
-	if i < 0 {
-		return "", errors.Errorf("findID: caller name not found in:\n%s", buf)
-	}
-	buf = buf[i+len(callerName):]
-
-	// find next ')'
-	i = bytes.IndexByte(buf, ')')
-	if i < 0 {
-		return "", errors.Errorf("findID: end of args not found in:\n%s", buf)
-	}
-	buf = buf[:i]
-
-	// trim off first argument
-	// find next ','
-	i = bytes.IndexByte(buf, ',')
-	if i >= 0 {
-		buf = buf[:i]
-	}
-
-	return string(buf), nil
-}
-
-var connServeFunction = []byte("(*Conn).Serve(")
-
 // CheckPasswd handle auth based on configuration
+//
+// This is not used - the one in Driver should be called instead
 func (s *server) CheckPasswd(user, pass string) (ok bool, err error) {
-	var VFS *vfs.VFS
-	if s.proxy != nil {
-		VFS, _, err = s.proxy.Call(user, pass)
-		if err != nil {
-			fs.Infof(nil, "proxy login failed: %v", err)
-			return false, nil
-		}
-		id, err := findID(connServeFunction)
-		if err != nil {
-			fs.Infof(nil, "proxy login failed: failed to read ID from stack: %v", err)
-			return false, nil
-		}
-		s.pendingMu.Lock()
-		d := s.pending[id]
-		delete(s.pending, id)
-		s.pendingMu.Unlock()
-		if d == nil {
-			return false, errors.Errorf("proxy login failed: failed to find pending Driver under ID %q", id)
-		}
-		d.vfs = VFS
-	} else {
-		ok = s.opt.BasicUser == user && (s.opt.BasicPass == "" || s.opt.BasicPass == pass)
-		if !ok {
-			fs.Infof(nil, "login failed: bad credentials")
-			return false, nil
-		}
-	}
-	return true, nil
+	err = errors.New("internal error: server.CheckPasswd should never be called")
+	fs.Errorf(nil, "Error: %v", err)
+	return false, err
 }
 
 // NewDriver starts a new session for each client connection
@@ -291,15 +233,25 @@ type Driver struct {
 	lock sync.Mutex
 }
 
-//Init a connection
-func (d *Driver) Init(c *ftp.Conn) {
-	defer log.Trace("", "Init session")("")
-	if d.s.proxy != nil {
-		id := fmt.Sprintf("%p", c)
-		d.s.pendingMu.Lock()
-		d.s.pending[id] = d
-		d.s.pendingMu.Unlock()
+// CheckPasswd handle auth based on configuration
+func (d *Driver) CheckPasswd(user, pass string) (ok bool, err error) {
+	s := d.s
+	if s.proxy != nil {
+		var VFS *vfs.VFS
+		VFS, _, err = s.proxy.Call(user, pass, false)
+		if err != nil {
+			fs.Infof(nil, "proxy login failed: %v", err)
+			return false, nil
+		}
+		d.vfs = VFS
+	} else {
+		ok = s.opt.BasicUser == user && (s.opt.BasicPass == "" || s.opt.BasicPass == pass)
+		if !ok {
+			fs.Infof(nil, "login failed: bad credentials")
+			return false, nil
+		}
 	}
+	return true, nil
 }
 
 //Stat get information on file or folder
@@ -351,7 +303,7 @@ func (d *Driver) ListDir(path string, callback func(ftp.FileInfo) error) (err er
 	// Account the transfer
 	tr := accounting.GlobalStats().NewTransferRemoteSize(path, node.Size())
 	defer func() {
-		tr.Done(err)
+		tr.Done(d.s.ctx, err)
 	}()
 
 	for _, file := range dirEntries {
@@ -442,14 +394,14 @@ func (d *Driver) GetFile(path string, offset int64) (size int64, fr io.ReadClose
 	if err != nil {
 		return 0, nil, err
 	}
-	_, err = handle.Seek(offset, os.SEEK_SET)
+	_, err = handle.Seek(offset, io.SeekStart)
 	if err != nil {
 		return 0, nil, err
 	}
 
 	// Account the transfer
 	tr := accounting.GlobalStats().NewTransferRemoteSize(path, node.Size())
-	defer tr.Done(nil)
+	defer tr.Done(d.s.ctx, nil)
 
 	return node.Size(), handle, nil
 }

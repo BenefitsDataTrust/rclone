@@ -13,12 +13,12 @@ import (
 
 	"github.com/anacrolix/dms/soap"
 
+	"github.com/rclone/rclone/fs/config/configfile"
 	"github.com/rclone/rclone/vfs"
 
 	_ "github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/cmd/serve/dlna/dlnaflags"
 	"github.com/rclone/rclone/fs"
-	"github.com/rclone/rclone/fs/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -41,9 +41,9 @@ func startServer(t *testing.T, f fs.Fs) {
 }
 
 func TestInit(t *testing.T) {
-	config.LoadConfig()
+	configfile.LoadConfig(context.Background())
 
-	f, err := fs.NewFs("testdata/files")
+	f, err := fs.NewFs(context.Background(), "testdata/files")
 	l, _ := f.List(context.Background(), "")
 	fmt.Println(l)
 	require.NoError(t, err)
@@ -122,8 +122,10 @@ func TestContentDirectoryBrowseMetadata(t *testing.T) {
 	// expect a <container> element
 	require.Contains(t, string(body), html.EscapeString("<container "))
 	require.NotContains(t, string(body), html.EscapeString("<item "))
-	// with a non-zero childCount
-	require.Regexp(t, " childCount=&#34;[1-9]", string(body))
+	// if there is a childCount, it better not be zero
+	require.NotContains(t, string(body), html.EscapeString(" childCount=\"0\""))
+	// should have a dc:date element
+	require.Contains(t, string(body), html.EscapeString("<dc:date>"))
 }
 
 // Check that the X_MS_MediaReceiverRegistrar is faked out properly.

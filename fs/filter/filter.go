@@ -17,8 +17,10 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// Active is the globally active filter
-var Active = mustNewFilter(nil)
+// This is the globally active filter
+//
+// This is accessed through GetConfig and AddConfig
+var globalConfig = mustNewFilter(nil)
 
 // rule is one filter rule
 type rule struct {
@@ -88,6 +90,7 @@ type Opt struct {
 	IncludeRule    []string
 	IncludeFrom    []string
 	FilesFrom      []string
+	FilesFromRaw   []string
 	MinAge         fs.Duration
 	MaxAge         fs.Duration
 	MinSize        fs.SizeSuffix
@@ -150,7 +153,7 @@ func NewFilter(opt *Opt) (f *Filter, err error) {
 		addImplicitExclude = true
 	}
 	for _, rule := range f.Opt.IncludeFrom {
-		err := forEachLine(rule, func(line string) error {
+		err := forEachLine(rule, false, func(line string) error {
 			return f.Add(true, line)
 		})
 		if err != nil {
@@ -166,7 +169,7 @@ func NewFilter(opt *Opt) (f *Filter, err error) {
 		foundExcludeRule = true
 	}
 	for _, rule := range f.Opt.ExcludeFrom {
-		err := forEachLine(rule, func(line string) error {
+		err := forEachLine(rule, false, func(line string) error {
 			return f.Add(false, line)
 		})
 		if err != nil {
@@ -186,32 +189,49 @@ func NewFilter(opt *Opt) (f *Filter, err error) {
 		}
 	}
 	for _, rule := range f.Opt.FilterFrom {
-		err := forEachLine(rule, f.AddRule)
+		err := forEachLine(rule, false, f.AddRule)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	inActive := f.InActive()
+
 	for _, rule := range f.Opt.FilesFrom {
 		if !inActive {
-			return nil, fmt.Errorf("The usage of --files-from overrides all other filters, it should be used alone")
+			return nil, fmt.Errorf("The usage of --files-from overrides all other filters, it should be used alone or with --files-from-raw")
 		}
 		f.initAddFile() // init to show --files-from set even if no files within
-		err := forEachLine(rule, func(line string) error {
+		err := forEachLine(rule, false, func(line string) error {
 			return f.AddFile(line)
 		})
 		if err != nil {
 			return nil, err
 		}
 	}
+
+	for _, rule := range f.Opt.FilesFromRaw {
+		// --files-from-raw can be used with --files-from, hence we do
+		// not need to get the value of f.InActive again
+		if !inActive {
+			return nil, fmt.Errorf("The usage of --files-from-raw overrides all other filters, it should be used alone or with --files-from")
+		}
+		f.initAddFile() // init to show --files-from set even if no files within
+		err := forEachLine(rule, true, func(line string) error {
+			return f.AddFile(line)
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	if addImplicitExclude {
 		err = f.Add(false, "/**")
 		if err != nil {
 			return nil, err
 		}
 	}
-	if fs.Config.Dump&fs.DumpFilters != 0 {
+	if fs.GetConfig(context.Background()).Dump&fs.DumpFilters != 0 {
 		fmt.Println("--- start filters ---")
 		fmt.Println(f.DumpFilters())
 		fmt.Println("--- end filters ---")
@@ -247,6 +267,10 @@ func (f *Filter) addDirGlobs(Include bool, glob string) error {
 func (f *Filter) Add(Include bool, glob string) error {
 	isDirRule := strings.HasSuffix(glob, "/")
 	isFileRule := !isDirRule
+	// Make excluding "dir/" equivalent to excluding "dir/**"
+	if isDirRule && !Include {
+		glob += "**"
+	}
 	if strings.Contains(glob, "**") {
 		isDirRule, isFileRule = true, true
 	}
@@ -408,7 +432,7 @@ func (f *Filter) IncludeDirectory(ctx context.Context, fs fs.Fs) func(string) (b
 }
 
 // DirContainsExcludeFile checks if exclude file is present in a
-// directroy. If fs is nil, it works properly if ExcludeFile is an
+// directory. If fs is nil, it works properly if ExcludeFile is an
 // empty string (for testing).
 func (f *Filter) DirContainsExcludeFile(ctx context.Context, fremote fs.Fs, remote string) (bool, error) {
 	if len(f.Opt.ExcludeFile) > 0 {
@@ -463,19 +487,26 @@ func (f *Filter) IncludeObject(ctx context.Context, o fs.Object) bool {
 
 // forEachLine calls fn on every line in the file pointed to by path
 //
-// It ignores empty lines and lines starting with '#' or ';'
-func forEachLine(path string, fn func(string) error) (err error) {
-	in, err := os.Open(path)
-	if err != nil {
-		return err
+// It ignores empty lines and lines starting with '#' or ';' if raw is false
+func forEachLine(path string, raw bool, fn func(string) error) (err error) {
+	var scanner *bufio.Scanner
+	if path == "-" {
+		scanner = bufio.NewScanner(os.Stdin)
+	} else {
+		in, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		scanner = bufio.NewScanner(in)
+		defer fs.CheckClose(in, &err)
 	}
-	defer fs.CheckClose(in, &err)
-	scanner := bufio.NewScanner(in)
 	for scanner.Scan() {
 		line := scanner.Text()
-		line = strings.TrimSpace(line)
-		if len(line) == 0 || line[0] == '#' || line[0] == ';' {
-			continue
+		if !raw {
+			line = strings.TrimSpace(line)
+			if len(line) == 0 || line[0] == '#' || line[0] == ';' {
+				continue
+			}
 		}
 		err := fn(line)
 		if err != nil {
@@ -515,14 +546,16 @@ var errFilesFromNotSet = errors.New("--files-from not set so can't use Filter.Li
 // MakeListR makes function to return all the files set using --files-from
 func (f *Filter) MakeListR(ctx context.Context, NewObject func(ctx context.Context, remote string) (fs.Object, error)) fs.ListRFn {
 	return func(ctx context.Context, dir string, callback fs.ListRCallback) error {
+		ci := fs.GetConfig(ctx)
 		if !f.HaveFilesFrom() {
 			return errFilesFromNotSet
 		}
 		var (
-			remotes = make(chan string, fs.Config.Checkers)
-			g       errgroup.Group
+			checkers = ci.Checkers
+			remotes  = make(chan string, checkers)
+			g        errgroup.Group
 		)
-		for i := 0; i < fs.Config.Checkers; i++ {
+		for i := 0; i < checkers; i++ {
 			g.Go(func() (err error) {
 				var entries = make(fs.DirEntries, 1)
 				for remote := range remotes {
@@ -563,4 +596,52 @@ func (f *Filter) UsesDirectoryFilters() bool {
 		return false
 	}
 	return true
+}
+
+type configContextKeyType struct{}
+
+// Context key for config
+var configContextKey = configContextKeyType{}
+
+// GetConfig returns the global or context sensitive config
+func GetConfig(ctx context.Context) *Filter {
+	if ctx == nil {
+		return globalConfig
+	}
+	c := ctx.Value(configContextKey)
+	if c == nil {
+		return globalConfig
+	}
+	return c.(*Filter)
+}
+
+// CopyConfig copies the global config (if any) from srcCtx into
+// dstCtx returning the new context.
+func CopyConfig(dstCtx, srcCtx context.Context) context.Context {
+	if srcCtx == nil {
+		return dstCtx
+	}
+	c := srcCtx.Value(configContextKey)
+	if c == nil {
+		return dstCtx
+	}
+	return context.WithValue(dstCtx, configContextKey, c)
+}
+
+// AddConfig returns a mutable config structure based on a shallow
+// copy of that found in ctx and returns a new context with that added
+// to it.
+func AddConfig(ctx context.Context) (context.Context, *Filter) {
+	c := GetConfig(ctx)
+	cCopy := new(Filter)
+	*cCopy = *c
+	newCtx := context.WithValue(ctx, configContextKey, cCopy)
+	return newCtx, cCopy
+}
+
+// ReplaceConfig replaces the filter config in the ctx with the one
+// passed in and returns a new context with that added to it.
+func ReplaceConfig(ctx context.Context, f *Filter) context.Context {
+	newCtx := context.WithValue(ctx, configContextKey, f)
+	return newCtx
 }

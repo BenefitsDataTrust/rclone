@@ -25,6 +25,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/fs/config/configfile"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/walk"
 	"github.com/rclone/rclone/lib/random"
@@ -45,7 +46,7 @@ var (
 	// SizeLimit signals tests to skip maximum test file size and skip inappropriate runs
 	SizeLimit = flag.Int64("size-limit", 0, "Limit maximum test file size")
 	// ListRetries is the number of times to retry a listing to overcome eventual consistency
-	ListRetries = flag.Int("list-retries", 6, "Number or times to retry listing")
+	ListRetries = flag.Int("list-retries", 3, "Number or times to retry listing")
 	// MatchTestRemote matches the remote names used for testing
 	MatchTestRemote = regexp.MustCompile(`^rclone-test-[abcdefghijklmnopqrstuvwxyz0123456789]{24}$`)
 )
@@ -58,28 +59,31 @@ func init() {
 
 // Initialise rclone for testing
 func Initialise() {
+	ctx := context.Background()
+	ci := fs.GetConfig(ctx)
 	// Never ask for passwords, fail instead.
 	// If your local config is encrypted set environment variable
 	// "RCLONE_CONFIG_PASS=hunter2" (or your password)
-	fs.Config.AskPassword = false
+	ci.AskPassword = false
 	// Override the config file from the environment - we don't
 	// parse the flags any more so this doesn't happen
 	// automatically
 	if envConfig := os.Getenv("RCLONE_CONFIG"); envConfig != "" {
 		config.ConfigPath = envConfig
 	}
-	config.LoadConfig()
+	configfile.LoadConfig(ctx)
+	accounting.Start(ctx)
 	if *Verbose {
-		fs.Config.LogLevel = fs.LogLevelDebug
+		ci.LogLevel = fs.LogLevelDebug
 	}
 	if *DumpHeaders {
-		fs.Config.Dump |= fs.DumpHeaders
+		ci.Dump |= fs.DumpHeaders
 	}
 	if *DumpBodies {
-		fs.Config.Dump |= fs.DumpBodies
+		ci.Dump |= fs.DumpBodies
 	}
-	fs.Config.LowLevelRetries = *LowLevelRetries
-	fs.Config.UseListR = *UseListR
+	ci.LowLevelRetries = *LowLevelRetries
+	ci.UseListR = *UseListR
 }
 
 // Item represents an item for checking
@@ -117,10 +121,16 @@ func CheckTimeEqualWithPrecision(t0, t1 time.Time, precision time.Duration) (tim
 	return dt, true
 }
 
+// AssertTimeEqualWithPrecision checks that want is within precision
+// of got, asserting that with t and logging remote
+func AssertTimeEqualWithPrecision(t *testing.T, remote string, want, got time.Time, precision time.Duration) {
+	dt, ok := CheckTimeEqualWithPrecision(want, got, precision)
+	assert.True(t, ok, fmt.Sprintf("%s: Modification time difference too big |%s| > %s (want %s vs got %s) (precision %s)", remote, dt, precision, want, got, precision))
+}
+
 // CheckModTime checks the mod time to the given precision
 func (i *Item) CheckModTime(t *testing.T, obj fs.Object, modTime time.Time, precision time.Duration) {
-	dt, ok := CheckTimeEqualWithPrecision(modTime, i.ModTime, precision)
-	assert.True(t, ok, fmt.Sprintf("%s: Modification time difference too big |%s| > %s (%s vs %s) (precision %s)", obj.Remote(), dt, precision, modTime, i.ModTime, precision))
+	AssertTimeEqualWithPrecision(t, obj.Remote(), i.ModTime, modTime, precision)
 }
 
 // CheckHashes checks all the hashes the object supports are correct
@@ -223,7 +233,7 @@ func makeListingFromObjects(objs []fs.Object) string {
 // filterEmptyDirs removes any empty (or containing only directories)
 // directories from expectedDirs
 func filterEmptyDirs(t *testing.T, items []Item, expectedDirs []string) (newExpectedDirs []string) {
-	dirs := map[string]struct{}{"": struct{}{}}
+	dirs := map[string]struct{}{"": {}}
 	for _, item := range items {
 		base := item.Path
 		for {
@@ -338,7 +348,7 @@ func CheckListing(t *testing.T, f fs.Fs, items []Item) {
 // CheckItems checks the fs to see if it has only the items passed in
 // using a precision of fs.Config.ModifyWindow
 func CheckItems(t *testing.T, f fs.Fs, items ...Item) {
-	CheckListingWithPrecision(t, f, items, nil, fs.GetModifyWindow(f))
+	CheckListingWithPrecision(t, f, items, nil, fs.GetModifyWindow(context.TODO(), f))
 }
 
 // CompareItems compares a set of DirEntries to a slice of items and a list of dirs
@@ -447,7 +457,7 @@ func RandomRemote() (fs.Fs, string, func(), error) {
 		return nil, "", nil, err
 	}
 
-	remote, err := fs.NewFs(remoteName)
+	remote, err := fs.NewFs(context.Background(), remoteName)
 	if err != nil {
 		return nil, "", nil, err
 	}
@@ -476,7 +486,7 @@ func Purge(f fs.Fs) {
 	if doPurge := f.Features().Purge; doPurge != nil {
 		doFallbackPurge = false
 		fs.Debugf(f, "Purge remote")
-		err = doPurge(ctx)
+		err = doPurge(ctx, "")
 		if err == fs.ErrorCantPurge {
 			doFallbackPurge = true
 		}

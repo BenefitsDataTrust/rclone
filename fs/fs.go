@@ -3,6 +3,8 @@ package fs
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -61,7 +63,7 @@ var (
 	ErrorListAborted                 = errors.New("list aborted")
 	ErrorListBucketRequired          = errors.New("bucket or container name is needed in remote")
 	ErrorIsFile                      = errors.New("is a file not a directory")
-	ErrorNotAFile                    = errors.New("is a not a regular file")
+	ErrorNotAFile                    = errors.New("is not a regular file")
 	ErrorNotDeleting                 = errors.New("not deleting files as there were IO errors")
 	ErrorNotDeletingDirs             = errors.New("not deleting directories as there were IO errors")
 	ErrorOverlapping                 = errors.New("can't sync or move files on overlapping remotes")
@@ -70,6 +72,8 @@ var (
 	ErrorPermissionDenied            = errors.New("permission denied")
 	ErrorCantShareDirectories        = errors.New("this backend can't share directories with link")
 	ErrorNotImplemented              = errors.New("optional feature not implemented")
+	ErrorCommandNotFound             = errors.New("command not found")
+	ErrorFileNameTooLong             = errors.New("file name too long")
 )
 
 // RegInfo provides information about a filesystem
@@ -81,13 +85,15 @@ type RegInfo struct {
 	// Prefix for command line flags for this fs - defaults to Name if not set
 	Prefix string
 	// Create a new file system.  If root refers to an existing
-	// object, then it should return a Fs which which points to
+	// object, then it should return an Fs which which points to
 	// the parent of that object and ErrorIsFile.
-	NewFs func(name string, root string, config configmap.Mapper) (Fs, error) `json:"-"`
+	NewFs func(ctx context.Context, name string, root string, config configmap.Mapper) (Fs, error) `json:"-"`
 	// Function to call to help with config
-	Config func(name string, config configmap.Mapper) `json:"-"`
+	Config func(ctx context.Context, name string, config configmap.Mapper) `json:"-"`
 	// Options for the Fs configuration
 	Options Options
+	// The command help, if any
+	CommandHelp []CommandHelp
 }
 
 // FileName returns the on disk file name for this backend
@@ -188,7 +194,7 @@ func (o *Option) String() string {
 	return fmt.Sprint(o.GetValue())
 }
 
-// Set a Option from a string
+// Set an Option from a string
 func (o *Option) Set(s string) (err error) {
 	newValue, err := configstruct.StringToInterface(o.GetValue(), s)
 	if err != nil {
@@ -271,7 +277,7 @@ type Fs interface {
 
 	// Put in to the remote path with the modTime given of the given size
 	//
-	// When called from outside a Fs by rclone, src.Size() will always be >= 0.
+	// When called from outside an Fs by rclone, src.Size() will always be >= 0.
 	// But for unknown-sized objects (indicated by src.Size() == -1), Put should either
 	// return an error or upload it properly (rather than e.g. calling panic).
 	//
@@ -324,7 +330,7 @@ type Object interface {
 
 	// Update in to the object with the modTime given of the given size
 	//
-	// When called from outside a Fs by rclone, src.Size() will always be >= 0.
+	// When called from outside an Fs by rclone, src.Size() will always be >= 0.
 	// But for unknown-sized objects (indicated by src.Size() == -1), Upload should either
 	// return an error or update the object properly (rather than e.g. calling panic).
 	Update(ctx context.Context, in io.Reader, src ObjectInfo, options ...OpenOption) error
@@ -392,6 +398,12 @@ type IDer interface {
 	ID() string
 }
 
+// ParentIDer is an optional interface for Object
+type ParentIDer interface {
+	// ParentID returns the ID of the parent directory if known or nil if not
+	ParentID() string
+}
+
 // ObjectUnWrapper is an optional interface for Object
 type ObjectUnWrapper interface {
 	// UnWrap returns the Object that this Object is wrapping or
@@ -410,6 +422,29 @@ type SetTierer interface {
 type GetTierer interface {
 	// GetTier returns storage tier or class of the Object
 	GetTier() string
+}
+
+// FullObjectInfo contains all the read-only optional interfaces
+//
+// Use for checking making wrapping ObjectInfos implement everything
+type FullObjectInfo interface {
+	ObjectInfo
+	MimeTyper
+	IDer
+	ObjectUnWrapper
+	GetTierer
+}
+
+// FullObject contains all the optional interfaces for Object
+//
+// Use for checking making wrapping Objects implement everything
+type FullObject interface {
+	Object
+	MimeTyper
+	IDer
+	ObjectUnWrapper
+	GetTierer
+	SetTierer
 }
 
 // ObjectOptionalInterfaces returns the names of supported and
@@ -464,7 +499,7 @@ type Usage struct {
 	Total   *int64 `json:"total,omitempty"`   // quota of bytes that can be used
 	Used    *int64 `json:"used,omitempty"`    // bytes in use
 	Trashed *int64 `json:"trashed,omitempty"` // bytes in trash
-	Other   *int64 `json:"other,omitempty"`   // other usage eg gmail in drive
+	Other   *int64 `json:"other,omitempty"`   // other usage e.g. gmail in drive
 	Free    *int64 `json:"free,omitempty"`    // bytes which can be uploaded before reaching the quota
 	Objects *int64 `json:"objects,omitempty"` // objects in the storage system
 }
@@ -483,22 +518,24 @@ type Features struct {
 	ReadMimeType            bool // can read the mime type of objects
 	WriteMimeType           bool // can set the mime type of objects
 	CanHaveEmptyDirectories bool // can have empty directories
-	BucketBased             bool // is bucket based (like s3, swift etc)
+	BucketBased             bool // is bucket based (like s3, swift, etc.)
 	BucketBasedRootOK       bool // is bucket based and can use from root
 	SetTier                 bool // allows set tier functionality on objects
 	GetTier                 bool // allows to retrieve storage tier of objects
-	ServerSideAcrossConfigs bool // can server side copy between different remotes of the same type
+	ServerSideAcrossConfigs bool // can server-side copy between different remotes of the same type
 	IsLocal                 bool // is the local backend
+	SlowModTime             bool // if calling ModTime() generally takes an extra transaction
+	SlowHash                bool // if calling Hash() generally takes an extra transaction
 
-	// Purge all files in the root and the root directory
+	// Purge all files in the directory specified
 	//
 	// Implement this if you have a way of deleting all the files
 	// quicker than just running Remove() on the result of List()
 	//
 	// Return an error if it doesn't exist
-	Purge func(ctx context.Context) error
+	Purge func(ctx context.Context, dir string) error
 
-	// Copy src to this remote using server side copy operations.
+	// Copy src to this remote using server-side copy operations.
 	//
 	// This is stored with the remote path given
 	//
@@ -509,7 +546,7 @@ type Features struct {
 	// If it isn't possible then return fs.ErrorCantCopy
 	Copy func(ctx context.Context, src Object, remote string) (Object, error)
 
-	// Move src to this remote using server side move operations.
+	// Move src to this remote using server-side move operations.
 	//
 	// This is stored with the remote path given
 	//
@@ -521,7 +558,7 @@ type Features struct {
 	Move func(ctx context.Context, src Object, remote string) (Object, error)
 
 	// DirMove moves src, srcRemote to this remote at dstRemote
-	// using server side move operations.
+	// using server-side move operations.
 	//
 	// Will only be called if src.Fs().Name() == f.Name()
 	//
@@ -549,7 +586,7 @@ type Features struct {
 	DirCacheFlush func()
 
 	// PublicLink generates a public link to the remote path (usually readable by anyone)
-	PublicLink func(ctx context.Context, remote string) (string, error)
+	PublicLink func(ctx context.Context, remote string, expire Duration, unlink bool) (string, error)
 
 	// Put in to the remote path with the modTime given of the given size
 	//
@@ -611,6 +648,21 @@ type Features struct {
 
 	// Disconnect the current user
 	Disconnect func(ctx context.Context) error
+
+	// Command the backend to run a named command
+	//
+	// The command run is name
+	// args may be used to read arguments from
+	// opts may be used to read optional arguments from
+	//
+	// The result should be capable of being JSON encoded
+	// If it is a string or a []string it will be shown to the user
+	// otherwise it will be JSON encoded and shown to the user like that
+	Command func(ctx context.Context, name string, arg []string, opt map[string]string) (interface{}, error)
+
+	// Shutdown the backend, closing any background tasks and any
+	// cached connections.
+	Shutdown func(ctx context.Context) error
 }
 
 // Disable nil's out the named feature.  If it isn't found then it
@@ -676,7 +728,7 @@ func (ft *Features) DisableList(list []string) *Features {
 // Fill fills in the function pointers in the Features struct from the
 // optional interfaces.  It returns the original updated Features
 // struct passed in.
-func (ft *Features) Fill(f Fs) *Features {
+func (ft *Features) Fill(ctx context.Context, f Fs) *Features {
 	if do, ok := f.(Purger); ok {
 		ft.Purge = do.Purge
 	}
@@ -732,7 +784,13 @@ func (ft *Features) Fill(f Fs) *Features {
 	if do, ok := f.(Disconnecter); ok {
 		ft.Disconnect = do.Disconnect
 	}
-	return ft.DisableList(Config.DisableFeatures)
+	if do, ok := f.(Commander); ok {
+		ft.Command = do.Command
+	}
+	if do, ok := f.(Shutdowner); ok {
+		ft.Shutdown = do.Shutdown
+	}
+	return ft.DisableList(GetConfig(ctx).DisableFeatures)
 }
 
 // Mask the Features with the Fs passed in
@@ -741,7 +799,7 @@ func (ft *Features) Fill(f Fs) *Features {
 // Fs AND the one passed in will be advertised.  Any features which
 // aren't in both will be set to false/nil, except for UnWrap/Wrap which
 // will be left untouched.
-func (ft *Features) Mask(f Fs) *Features {
+func (ft *Features) Mask(ctx context.Context, f Fs) *Features {
 	mask := f.Features()
 	ft.CaseInsensitive = ft.CaseInsensitive && mask.CaseInsensitive
 	ft.DuplicateFiles = ft.DuplicateFiles && mask.DuplicateFiles
@@ -752,6 +810,10 @@ func (ft *Features) Mask(f Fs) *Features {
 	ft.BucketBasedRootOK = ft.BucketBasedRootOK && mask.BucketBasedRootOK
 	ft.SetTier = ft.SetTier && mask.SetTier
 	ft.GetTier = ft.GetTier && mask.GetTier
+	ft.ServerSideAcrossConfigs = ft.ServerSideAcrossConfigs && mask.ServerSideAcrossConfigs
+	// ft.IsLocal = ft.IsLocal && mask.IsLocal Don't propagate IsLocal
+	ft.SlowModTime = ft.SlowModTime && mask.SlowModTime
+	ft.SlowHash = ft.SlowHash && mask.SlowHash
 
 	if mask.Purge == nil {
 		ft.Purge = nil
@@ -807,7 +869,11 @@ func (ft *Features) Mask(f Fs) *Features {
 	if mask.Disconnect == nil {
 		ft.Disconnect = nil
 	}
-	return ft.DisableList(Config.DisableFeatures)
+	// Command is always local so we don't mask it
+	if mask.Shutdown == nil {
+		ft.Shutdown = nil
+	}
+	return ft.DisableList(GetConfig(ctx).DisableFeatures)
 }
 
 // Wrap makes a Copy of the features passed in, overriding the UnWrap/Wrap
@@ -836,18 +902,18 @@ func (ft *Features) WrapsFs(f Fs, w Fs) *Features {
 
 // Purger is an optional interfaces for Fs
 type Purger interface {
-	// Purge all files in the root and the root directory
+	// Purge all files in the directory specified
 	//
 	// Implement this if you have a way of deleting all the files
 	// quicker than just running Remove() on the result of List()
 	//
 	// Return an error if it doesn't exist
-	Purge(ctx context.Context) error
+	Purge(ctx context.Context, dir string) error
 }
 
 // Copier is an optional interface for Fs
 type Copier interface {
-	// Copy src to this remote using server side copy operations.
+	// Copy src to this remote using server-side copy operations.
 	//
 	// This is stored with the remote path given
 	//
@@ -861,7 +927,7 @@ type Copier interface {
 
 // Mover is an optional interface for Fs
 type Mover interface {
-	// Move src to this remote using server side move operations.
+	// Move src to this remote using server-side move operations.
 	//
 	// This is stored with the remote path given
 	//
@@ -876,7 +942,7 @@ type Mover interface {
 // DirMover is an optional interface for Fs
 type DirMover interface {
 	// DirMove moves src, srcRemote to this remote at dstRemote
-	// using server side move operations.
+	// using server-side move operations.
 	//
 	// Will only be called if src.Fs().Name() == f.Name()
 	//
@@ -947,7 +1013,7 @@ type PutStreamer interface {
 // PublicLinker is an optional interface for Fs
 type PublicLinker interface {
 	// PublicLink generates a public link to the remote path (usually readable by anyone)
-	PublicLink(ctx context.Context, remote string) (string, error)
+	PublicLink(ctx context.Context, remote string, expire Duration, unlink bool) (string, error)
 }
 
 // MergeDirser is an option interface for Fs
@@ -1028,6 +1094,37 @@ type Disconnecter interface {
 	Disconnect(ctx context.Context) error
 }
 
+// CommandHelp describes a single backend Command
+//
+// These are automatically inserted in the docs
+type CommandHelp struct {
+	Name  string            // Name of the command, e.g. "link"
+	Short string            // Single line description
+	Long  string            // Long multi-line description
+	Opts  map[string]string // maps option name to a single line help
+}
+
+// Commander is an interface to wrap the Command function
+type Commander interface {
+	// Command the backend to run a named command
+	//
+	// The command run is name
+	// args may be used to read arguments from
+	// opts may be used to read optional arguments from
+	//
+	// The result should be capable of being JSON encoded
+	// If it is a string or a []string it will be shown to the user
+	// otherwise it will be JSON encoded and shown to the user like that
+	Command(ctx context.Context, name string, arg []string, opt map[string]string) (interface{}, error)
+}
+
+// Shutdowner is an interface to wrap the Shutdown function
+type Shutdowner interface {
+	// Shutdown the backend, closing any background tasks and any
+	// cached connections.
+	Shutdown(ctx context.Context) error
+}
+
 // ObjectsChan is a channel of Objects
 type ObjectsChan chan Object
 
@@ -1072,7 +1169,17 @@ func UnWrapObject(o Object) Object {
 	return o
 }
 
-// Find looks for an RegInfo object for the name passed in.  The name
+// UnWrapObjectInfo returns the underlying Object unwrapped as much as
+// possible or nil.
+func UnWrapObjectInfo(oi ObjectInfo) Object {
+	o, ok := oi.(Object)
+	if !ok {
+		return nil
+	}
+	return UnWrapObject(o)
+}
+
+// Find looks for a RegInfo object for the name passed in.  The name
 // can be either the Name or the Prefix.
 //
 // Services are looked up in the config file
@@ -1100,21 +1207,22 @@ func MustFind(name string) *RegInfo {
 
 // ParseRemote deconstructs a path into configName, fsPath, looking up
 // the fsName in the config file (returning NotFoundInConfigFile if not found)
-func ParseRemote(path string) (fsInfo *RegInfo, configName, fsPath string, err error) {
-	configName, fsPath, err = fspath.Parse(path)
+func ParseRemote(path string) (fsInfo *RegInfo, configName, fsPath string, connectionStringConfig configmap.Simple, err error) {
+	parsed, err := fspath.Parse(path)
 	if err != nil {
-		return nil, "", "", err
+		return nil, "", "", nil, err
 	}
+	configName, fsPath = parsed.Name, parsed.Path
 	var fsName string
 	var ok bool
 	if configName != "" {
 		if strings.HasPrefix(configName, ":") {
 			fsName = configName[1:]
 		} else {
-			m := ConfigMap(nil, configName)
+			m := ConfigMap(nil, configName, parsed.Config)
 			fsName, ok = m.Get("type")
 			if !ok {
-				return nil, "", "", ErrorNotFoundInConfigFile
+				return nil, "", "", nil, ErrorNotFoundInConfigFile
 			}
 		}
 	} else {
@@ -1122,7 +1230,7 @@ func ParseRemote(path string) (fsInfo *RegInfo, configName, fsPath string, err e
 		configName = "local"
 	}
 	fsInfo, err = Find(fsName)
-	return fsInfo, configName, fsPath, err
+	return fsInfo, configName, fsPath, parsed.Config, err
 }
 
 // A configmap.Getter to read from the environment RCLONE_CONFIG_backend_option_name
@@ -1176,6 +1284,9 @@ type setConfigFile string
 
 // Set a config item into the config file
 func (section setConfigFile) Set(key, value string) {
+	if strings.HasPrefix(string(section), ":") {
+		Errorf(nil, "Can't save config %q = %q for on the fly backend %q", key, value, section)
+	}
 	Debugf(nil, "Saving config %q = %q in section %q of the config file", key, value, section)
 	err := ConfigFileSet(string(section), key, value)
 	if err != nil {
@@ -1197,27 +1308,33 @@ func (section getConfigFile) Get(key string) (value string, ok bool) {
 }
 
 // ConfigMap creates a configmap.Map from the *RegInfo and the
-// configName passed in.
+// configName passed in. If connectionStringConfig has any entries (it may be nil),
+// then it will be added to the lookup with the highest priority.
 //
 // If fsInfo is nil then the returned configmap.Map should only be
 // used for reading non backend specific parameters, such as "type".
-func ConfigMap(fsInfo *RegInfo, configName string) (config *configmap.Map) {
+func ConfigMap(fsInfo *RegInfo, configName string, connectionStringConfig configmap.Simple) (config *configmap.Map) {
 	// Create the config
 	config = configmap.New()
 
 	// Read the config, more specific to least specific
 
+	// Config from connection string
+	if len(connectionStringConfig) > 0 {
+		config.AddOverrideGetter(connectionStringConfig)
+	}
+
 	// flag values
 	if fsInfo != nil {
-		config.AddGetter(&regInfoValues{fsInfo, false})
+		config.AddOverrideGetter(&regInfoValues{fsInfo, false})
 	}
 
 	// remote specific environment vars
-	config.AddGetter(configEnvVars(configName))
+	config.AddOverrideGetter(configEnvVars(configName))
 
 	// backend specific environment vars
 	if fsInfo != nil {
-		config.AddGetter(optionEnvVars{fsInfo: fsInfo})
+		config.AddOverrideGetter(optionEnvVars{fsInfo: fsInfo})
 	}
 
 	// config file
@@ -1241,11 +1358,11 @@ func ConfigMap(fsInfo *RegInfo, configName string) (config *configmap.Map) {
 // found then NotFoundInConfigFile will be returned.
 func ConfigFs(path string) (fsInfo *RegInfo, configName, fsPath string, config *configmap.Map, err error) {
 	// Parse the remote path
-	fsInfo, configName, fsPath, err = ParseRemote(path)
+	fsInfo, configName, fsPath, connectionStringConfig, err := ParseRemote(path)
 	if err != nil {
 		return
 	}
-	config = ConfigMap(fsInfo, configName)
+	config = ConfigMap(fsInfo, configName, connectionStringConfig)
 	return
 }
 
@@ -1258,18 +1375,58 @@ func ConfigFs(path string) (fsInfo *RegInfo, configName, fsPath string, config *
 //
 // On Windows avoid single character remote names as they can be mixed
 // up with drive letters.
-func NewFs(path string) (Fs, error) {
+func NewFs(ctx context.Context, path string) (Fs, error) {
+	Debugf(nil, "Creating backend with remote %q", path)
 	fsInfo, configName, fsPath, config, err := ConfigFs(path)
 	if err != nil {
 		return nil, err
 	}
-	return fsInfo.NewFs(configName, fsPath, config)
+	// Now discover which config items have been overridden,
+	// either by the config string, command line flags or
+	// environment variables
+	var overridden = configmap.Simple{}
+	for i := range fsInfo.Options {
+		opt := &fsInfo.Options[i]
+		value, isSet := config.GetOverride(opt.Name)
+		if isSet {
+			overridden.Set(opt.Name, value)
+		}
+	}
+	if len(overridden) > 0 {
+		extraConfig := overridden.String()
+		//Debugf(nil, "detected overriden config %q", extraConfig)
+		md5sumBinary := md5.Sum([]byte(extraConfig))
+		suffix := base64.RawStdEncoding.EncodeToString(md5sumBinary[:])
+		// 5 characters length is 5*6 = 30 bits of base64
+		const maxLength = 5
+		if len(suffix) > maxLength {
+			suffix = suffix[:maxLength]
+		}
+		suffix = "{" + suffix + "}"
+		Debugf(configName, "detected overridden config - adding %q suffix to name", suffix)
+		// Add the suffix to the config name
+		//
+		// These need to work as filesystem names as the VFS cache will use them
+		configName += suffix
+	}
+	return fsInfo.NewFs(ctx, configName, fsPath, config)
+}
+
+// ConfigString returns a canonical version of the config string used
+// to configure the Fs as passed to fs.NewFs
+func ConfigString(f Fs) string {
+	name := f.Name()
+	root := f.Root()
+	if name == "local" && f.Features().IsLocal {
+		return root
+	}
+	return name + ":" + root
 }
 
 // TemporaryLocalFs creates a local FS in the OS's temporary directory.
 //
 // No cleanup is performed, the caller must call Purge on the Fs themselves.
-func TemporaryLocalFs() (Fs, error) {
+func TemporaryLocalFs(ctx context.Context) (Fs, error) {
 	path, err := ioutil.TempDir("", "rclone-spool")
 	if err == nil {
 		err = os.Remove(path)
@@ -1278,7 +1435,7 @@ func TemporaryLocalFs() (Fs, error) {
 		return nil, err
 	}
 	path = filepath.ToSlash(path)
-	return NewFs(path)
+	return NewFs(ctx, path)
 }
 
 // CheckClose is a utility function used to check the return from
@@ -1305,8 +1462,8 @@ func FileExists(ctx context.Context, fs Fs, remote string) (bool, error) {
 
 // GetModifyWindow calculates the maximum modify window between the given Fses
 // and the Config.ModifyWindow parameter.
-func GetModifyWindow(fss ...Info) time.Duration {
-	window := Config.ModifyWindow
+func GetModifyWindow(ctx context.Context, fss ...Info) time.Duration {
+	window := GetConfig(ctx).ModifyWindow
 	for _, f := range fss {
 		if f != nil {
 			precision := f.Precision()
@@ -1331,12 +1488,17 @@ type logCalculator struct {
 }
 
 // NewPacer creates a Pacer for the given Fs and Calculator.
-func NewPacer(c pacer.Calculator) *Pacer {
+func NewPacer(ctx context.Context, c pacer.Calculator) *Pacer {
+	ci := GetConfig(ctx)
+	retries := ci.LowLevelRetries
+	if retries <= 0 {
+		retries = 1
+	}
 	p := &Pacer{
 		Pacer: pacer.New(
 			pacer.InvokerOption(pacerInvoker),
-			pacer.MaxConnectionsOption(Config.Checkers+Config.Transfers),
-			pacer.RetriesOption(Config.LowLevelRetries),
+			pacer.MaxConnectionsOption(ci.Checkers+ci.Transfers),
+			pacer.RetriesOption(retries),
 			pacer.CalculatorOption(c),
 		),
 	}

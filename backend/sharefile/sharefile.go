@@ -87,21 +87,20 @@ import (
 	"github.com/pkg/errors"
 	"github.com/rclone/rclone/backend/sharefile/api"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/config/obscure"
-	"github.com/rclone/rclone/fs/encodings"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/dircache"
+	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/random"
 	"github.com/rclone/rclone/lib/rest"
 	"golang.org/x/oauth2"
 )
-
-const enc = encodings.Sharefile
 
 const (
 	rcloneClientID              = "djQUPlHTUM9EvayYBWuKC5IrVIoQde46"
@@ -137,7 +136,7 @@ func init() {
 		Name:        "sharefile",
 		Description: "Citrix Sharefile",
 		NewFs:       NewFs,
-		Config: func(name string, m configmap.Mapper) {
+		Config: func(ctx context.Context, name string, m configmap.Mapper) {
 			oauthConfig := newOauthConfig("")
 			checkAuth := func(oauthConfig *oauth2.Config, auth *oauthutil.AuthResult) error {
 				if auth == nil || auth.Form == nil {
@@ -153,7 +152,10 @@ func init() {
 				oauthConfig.Endpoint.TokenURL = endpoint + tokenPath
 				return nil
 			}
-			err := oauthutil.ConfigWithCallback("sharefile", name, m, oauthConfig, checkAuth)
+			opt := oauthutil.Options{
+				CheckAuth: checkAuth,
+			}
+			err := oauthutil.Config(ctx, "sharefile", name, m, oauthConfig, &opt)
 			if err != nil {
 				log.Fatalf("Failed to configure token: %v", err)
 			}
@@ -204,16 +206,30 @@ be set manually to something like: https://XXX.sharefile.com
 `,
 			Advanced: true,
 			Default:  "",
+		}, {
+			Name:     config.ConfigEncoding,
+			Help:     config.ConfigEncodingHelp,
+			Advanced: true,
+			Default: (encoder.Base |
+				encoder.EncodeWin | // :?"*<>|
+				encoder.EncodeBackSlash | // \
+				encoder.EncodeCtl |
+				encoder.EncodeRightSpace |
+				encoder.EncodeRightPeriod |
+				encoder.EncodeLeftSpace |
+				encoder.EncodeLeftPeriod |
+				encoder.EncodeInvalidUtf8),
 		}},
 	})
 }
 
 // Options defines the configuration for this backend
 type Options struct {
-	RootFolderID string        `config:"root_folder_id"`
-	UploadCutoff fs.SizeSuffix `config:"upload_cutoff"`
-	ChunkSize    fs.SizeSuffix `config:"chunk_size"`
-	Endpoint     string        `config:"endpoint"`
+	RootFolderID string               `config:"root_folder_id"`
+	UploadCutoff fs.SizeSuffix        `config:"upload_cutoff"`
+	ChunkSize    fs.SizeSuffix        `config:"chunk_size"`
+	Endpoint     string               `config:"endpoint"`
+	Enc          encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote cloud storage system
@@ -221,6 +237,7 @@ type Fs struct {
 	name         string             // name of this remote
 	root         string             // the path we are working on
 	opt          Options            // parsed options
+	ci           *fs.ConfigInfo     // global config
 	features     *fs.Features       // optional features
 	srv          *rest.Client       // the connection to the server
 	dirCache     *dircache.DirCache // Map of directory path to directory id
@@ -282,7 +299,10 @@ var retryErrorCodes = []int{
 
 // shouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
-func shouldRetry(resp *http.Response, err error) (bool, error) {
+func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
 	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
@@ -301,13 +321,13 @@ func (f *Fs) readMetaDataForIDPath(ctx context.Context, id, path string, directo
 	}
 	if path != "" {
 		opts.Path += "/ByPath"
-		opts.Parameters.Set("path", "/"+enc.FromStandardPath(path))
+		opts.Parameters.Set("path", "/"+f.opt.Enc.FromStandardPath(path))
 	}
 	var item api.Item
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &item)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusNotFound {
@@ -334,7 +354,7 @@ func (f *Fs) readMetaDataForID(ctx context.Context, id string, directoriesOnly b
 
 // readMetaDataForPath reads the metadata from the path
 func (f *Fs) readMetaDataForPath(ctx context.Context, path string, directoriesOnly bool, filesOnly bool) (info *api.Item, err error) {
-	leaf, directoryID, err := f.dirCache.FindRootAndPath(ctx, path, false)
+	leaf, directoryID, err := f.dirCache.FindPath(ctx, path, false)
 	if err != nil {
 		if err == fs.ErrorDirNotFound {
 			return nil, fs.ErrorObjectNotFound
@@ -394,8 +414,7 @@ func (f *Fs) setUploadCutoff(cs fs.SizeSuffix) (old fs.SizeSuffix, err error) {
 }
 
 // NewFs constructs an Fs from the path, container:path
-func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
-	ctx := context.Background()
+func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
@@ -421,23 +440,25 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 	oauthConfig := newOauthConfig(opt.Endpoint + tokenPath)
 	var client *http.Client
 	var ts *oauthutil.TokenSource
-	client, ts, err = oauthutil.NewClient(name, m, oauthConfig)
+	client, ts, err = oauthutil.NewClient(ctx, name, m, oauthConfig)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to configure sharefile")
 	}
 
+	ci := fs.GetConfig(ctx)
 	f := &Fs{
 		name:  name,
 		root:  root,
 		opt:   *opt,
+		ci:    ci,
 		srv:   rest.NewClient(client).SetRoot(opt.Endpoint + apiPath),
-		pacer: fs.NewPacer(pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 	f.features = (&fs.Features{
 		CaseInsensitive:         true,
 		CanHaveEmptyDirectories: true,
 		ReadMimeType:            false,
-	}).Fill(f)
+	}).Fill(ctx, f)
 	f.srv.SetErrorHandler(errorHandler)
 	f.fillBufferTokens()
 
@@ -502,7 +523,7 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 			}
 			return nil, err
 		}
-		f.features.Fill(&tempF)
+		f.features.Fill(ctx, &tempF)
 		// XXX: update the old f here instead of returning tempF, since
 		// `features` were already filled with functions having *f as a receiver.
 		// See https://github.com/rclone/rclone/issues/2182
@@ -516,8 +537,8 @@ func NewFs(name, root string, m configmap.Mapper) (fs.Fs, error) {
 
 // Fill up (or reset) the buffer tokens
 func (f *Fs) fillBufferTokens() {
-	f.bufferTokens = make(chan []byte, fs.Config.Transfers)
-	for i := 0; i < fs.Config.Transfers; i++ {
+	f.bufferTokens = make(chan []byte, f.ci.Transfers)
+	for i := 0; i < f.ci.Transfers; i++ {
 		f.bufferTokens <- nil
 	}
 }
@@ -595,7 +616,7 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 // CreateDir makes a directory with pathID as parent and name leaf
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error) {
 	var resp *http.Response
-	leaf = enc.FromStandardName(leaf)
+	leaf = f.opt.Enc.FromStandardName(leaf)
 	var req = api.Item{
 		Name:      leaf,
 		FileName:  leaf,
@@ -613,7 +634,7 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 	}
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, &req, &info)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return "", errors.Wrap(err, "CreateDir")
@@ -645,7 +666,7 @@ func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, fi
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return found, errors.Wrap(err, "couldn't list files")
@@ -664,7 +685,7 @@ func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, fi
 			fs.Debugf(f, "Ignoring %q - unknown type %q", item.Name, item.Type)
 			continue
 		}
-		item.Name = enc.ToStandardName(item.Name)
+		item.Name = f.opt.Enc.ToStandardName(item.Name)
 		if fn(item) {
 			found = true
 			break
@@ -684,10 +705,6 @@ func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, fi
 // This should return ErrDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	err = f.dirCache.FindRoot(ctx, false)
-	if err != nil {
-		return nil, err
-	}
 	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
 		return nil, err
@@ -727,7 +744,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 // Used to create new objects
 func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time, size int64) (o *Object, leaf string, directoryID string, err error) {
 	// Create the directory for the object if it doesn't exist
-	leaf, directoryID, err = f.dirCache.FindRootAndPath(ctx, remote, true)
+	leaf, directoryID, err = f.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
 		return
 	}
@@ -783,13 +800,7 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 
 // Mkdir creates the container if it doesn't exist
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	err := f.dirCache.FindRoot(ctx, true)
-	if err != nil {
-		return err
-	}
-	if dir != "" {
-		_, err = f.dirCache.FindDir(ctx, dir, true)
-	}
+	_, err := f.dirCache.FindDir(ctx, dir, true)
 	return err
 }
 
@@ -801,10 +812,6 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 		return errors.New("can't purge root directory")
 	}
 	dc := f.dirCache
-	err := dc.FindRoot(ctx, false)
-	if err != nil {
-		return err
-	}
 	rootID, err := dc.FindDir(ctx, dir, false)
 	if err != nil {
 		return err
@@ -851,8 +858,8 @@ func (f *Fs) Precision() time.Duration {
 // Optional interface: Only implement this if you have a way of
 // deleting all the files quicker than just running Remove() on the
 // result of List()
-func (f *Fs) Purge(ctx context.Context) error {
-	return f.purgeCheck(ctx, "", false)
+func (f *Fs) Purge(ctx context.Context, dir string) error {
+	return f.purgeCheck(ctx, dir, false)
 }
 
 // updateItem patches a file or folder
@@ -873,7 +880,7 @@ func (f *Fs) updateItem(ctx context.Context, id, leaf, directoryID string, modTi
 			"overwrite": {"false"},
 		},
 	}
-	leaf = enc.FromStandardName(leaf)
+	leaf = f.opt.Enc.FromStandardName(leaf)
 	// FIXME this appears to be a bug in the API
 	//
 	// If you set the modified time via PATCH then the server
@@ -908,7 +915,7 @@ func (f *Fs) updateItem(ctx context.Context, id, leaf, directoryID string, modTi
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, &update, &info)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -962,7 +969,7 @@ func (f *Fs) move(ctx context.Context, isFile bool, id, oldLeaf, newLeaf, oldDir
 	return item, nil
 }
 
-// Move src to this remote using server side move operations.
+// Move src to this remote using server-side move operations.
 //
 // This is stored with the remote path given
 //
@@ -1004,7 +1011,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 }
 
 // DirMove moves src, srcRemote to this remote at dstRemote
-// using server side move operations.
+// using server-side move operations.
 //
 // Will only be called if src.Fs().Name() == f.Name()
 //
@@ -1017,75 +1024,14 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		fs.Debugf(srcFs, "Can't move directory - not same remote type")
 		return fs.ErrorCantDirMove
 	}
-	srcPath := path.Join(srcFs.root, srcRemote)
-	dstPath := path.Join(f.root, dstRemote)
 
-	// Refuse to move to or from the root
-	if srcPath == "" || dstPath == "" {
-		fs.Debugf(src, "DirMove error: Can't move root")
-		return errors.New("can't move root directory")
-	}
-
-	// find the root src directory
-	err := srcFs.dirCache.FindRoot(ctx, false)
-	if err != nil {
-		return err
-	}
-
-	// find the root dst directory
-	if dstRemote != "" {
-		err = f.dirCache.FindRoot(ctx, true)
-		if err != nil {
-			return err
-		}
-	} else {
-		if f.dirCache.FoundRoot() {
-			return fs.ErrorDirExists
-		}
-	}
-
-	// Find ID of dst parent, creating subdirs if necessary
-	var leaf, directoryID string
-	findPath := dstRemote
-	if dstRemote == "" {
-		findPath = f.root
-	}
-	leaf, directoryID, err = f.dirCache.FindPath(ctx, findPath, true)
-	if err != nil {
-		return err
-	}
-
-	// Check destination does not exist
-	if dstRemote != "" {
-		_, err = f.dirCache.FindDir(ctx, dstRemote, false)
-		if err == fs.ErrorDirNotFound {
-			// OK
-		} else if err != nil {
-			return err
-		} else {
-			return fs.ErrorDirExists
-		}
-	}
-
-	// Find ID of src
-	srcID, err := srcFs.dirCache.FindDir(ctx, srcRemote, false)
-	if err != nil {
-		return err
-	}
-
-	// Find ID of src parent, not creating subdirs
-	var srcLeaf, srcDirectoryID string
-	findPath = srcRemote
-	if srcRemote == "" {
-		findPath = srcFs.root
-	}
-	srcLeaf, srcDirectoryID, err = srcFs.dirCache.FindPath(ctx, findPath, false)
+	srcID, srcDirectoryID, srcLeaf, dstDirectoryID, dstLeaf, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
 	if err != nil {
 		return err
 	}
 
 	// Do the move
-	_, err = f.move(ctx, false, srcID, srcLeaf, leaf, srcDirectoryID, directoryID)
+	_, err = f.move(ctx, false, srcID, srcLeaf, dstLeaf, srcDirectoryID, dstDirectoryID)
 	if err != nil {
 		return err
 	}
@@ -1093,7 +1039,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	return nil
 }
 
-// Copy src to this remote using server side copy operations.
+// Copy src to this remote using server-side copy operations.
 //
 // This is stored with the remote path given
 //
@@ -1119,7 +1065,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (dst fs.Obj
 	if err != nil {
 		return nil, err
 	}
-	srcLeaf = enc.FromStandardName(srcLeaf)
+	srcLeaf = f.opt.Enc.FromStandardName(srcLeaf)
 	_ = srcParentID
 
 	// Create temporary object
@@ -1127,7 +1073,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (dst fs.Obj
 	if err != nil {
 		return nil, err
 	}
-	dstLeaf = enc.FromStandardName(dstLeaf)
+	dstLeaf = f.opt.Enc.FromStandardName(dstLeaf)
 
 	sameName := strings.ToLower(srcLeaf) == strings.ToLower(dstLeaf)
 	if sameName && srcParentID == dstParentID {
@@ -1149,7 +1095,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (dst fs.Obj
 		} else if err != nil {
 			return nil, errors.Wrap(err, "copy: failed to examine destination dir")
 		} else {
-			// otherwise need to copy via a temporary directlry
+			// otherwise need to copy via a temporary directory
 		}
 	}
 
@@ -1190,7 +1136,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (dst fs.Obj
 	var info *api.Item
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -1351,7 +1297,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	var dl api.DownloadSpecification
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &dl)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "open: fetch download specification")
@@ -1366,7 +1312,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	}
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.Call(ctx, &opts)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "open")
@@ -1386,11 +1332,11 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	isLargeFile := size < 0 || size > int64(o.fs.opt.UploadCutoff)
 
 	// Create the directory for the object if it doesn't exist
-	leaf, directoryID, err := o.fs.dirCache.FindRootAndPath(ctx, remote, true)
+	leaf, directoryID, err := o.fs.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
 		return err
 	}
-	leaf = enc.FromStandardName(leaf)
+	leaf = o.fs.opt.Enc.FromStandardName(leaf)
 	var req = api.UploadRequest{
 		Method:       "standard",
 		Raw:          true,
@@ -1398,7 +1344,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		Overwrite:    true,
 		CreatedDate:  modTime,
 		ModifiedDate: modTime,
-		Tool:         fs.Config.UserAgent,
+		Tool:         o.fs.ci.UserAgent,
 	}
 
 	if isLargeFile {
@@ -1408,7 +1354,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		} else {
 			// otherwise use threaded which is more efficient
 			req.Method = "threaded"
-			req.ThreadCount = &fs.Config.Transfers
+			req.ThreadCount = &o.fs.ci.Transfers
 			req.Filesize = &size
 		}
 	}
@@ -1416,12 +1362,13 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	var resp *http.Response
 	var info api.UploadSpecification
 	opts := rest.Opts{
-		Method: "POST",
-		Path:   "/Items(" + directoryID + ")/Upload2",
+		Method:  "POST",
+		Path:    "/Items(" + directoryID + ")/Upload2",
+		Options: options,
 	}
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, &req, &info)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return errors.Wrap(err, "upload get specification")
@@ -1446,7 +1393,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	var finish api.UploadFinishResponse
 	err = o.fs.pacer.CallNoRetry(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &finish)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return errors.Wrap(err, "upload file")
@@ -1482,7 +1429,7 @@ func (f *Fs) remove(ctx context.Context, id string) (err error) {
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.Call(ctx, &opts)
-		return shouldRetry(resp, err)
+		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return errors.Wrap(err, "remove")

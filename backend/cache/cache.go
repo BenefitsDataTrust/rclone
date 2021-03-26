@@ -1,4 +1,4 @@
-// +build !plan9
+// +build !plan9,!js
 
 package cache
 
@@ -65,9 +65,10 @@ func init() {
 		Name:        "cache",
 		Description: "Cache a remote",
 		NewFs:       NewFs,
+		CommandHelp: commandHelp,
 		Options: []fs.Option{{
 			Name:     "remote",
-			Help:     "Remote to cache.\nNormally should contain a ':' and a path, eg \"myremote:path/to/dir\",\n\"myremote:bucket\" or maybe \"myremote:\" (not recommended).",
+			Help:     "Remote to cache.\nNormally should contain a ':' and a path, e.g. \"myremote:path/to/dir\",\n\"myremote:bucket\" or maybe \"myremote:\" (not recommended).",
 			Required: true,
 		}, {
 			Name: "plex_url",
@@ -86,7 +87,7 @@ func init() {
 			Advanced: true,
 		}, {
 			Name:     "plex_insecure",
-			Help:     "Skip all certificate verifications when connecting to the Plex server",
+			Help:     "Skip all certificate verification when connecting to the Plex server",
 			Advanced: true,
 		}, {
 			Name: "chunk_size",
@@ -108,7 +109,7 @@ will need to be cleared or unexpected EOF errors will occur.`,
 			}},
 		}, {
 			Name: "info_age",
-			Help: `How long to cache file structure information (directory listings, file size, times etc). 
+			Help: `How long to cache file structure information (directory listings, file size, times, etc.). 
 If all write operations are done through the cache then you can safely make
 this value very large as the cache store will also be updated in real time.`,
 			Default: DefCacheInfoAge,
@@ -338,8 +339,8 @@ func parseRootPath(path string) (string, error) {
 	return strings.Trim(path, "/"), nil
 }
 
-// NewFs constructs a Fs from the path, container:path
-func NewFs(name, rootPath string, m configmap.Mapper) (fs.Fs, error) {
+// NewFs constructs an Fs from the path, container:path
+func NewFs(ctx context.Context, name, rootPath string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
@@ -360,15 +361,10 @@ func NewFs(name, rootPath string, m configmap.Mapper) (fs.Fs, error) {
 		return nil, errors.Wrapf(err, "failed to clean root path %q", rootPath)
 	}
 
-	wInfo, wName, wPath, wConfig, err := fs.ConfigFs(opt.Remote)
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to parse remote %q to wrap", opt.Remote)
-	}
-
-	remotePath := fspath.JoinRootPath(wPath, rootPath)
-	wrappedFs, wrapErr := wInfo.NewFs(wName, remotePath, wConfig)
+	remotePath := fspath.JoinRootPath(opt.Remote, rootPath)
+	wrappedFs, wrapErr := cache.Get(ctx, remotePath)
 	if wrapErr != nil && wrapErr != fs.ErrorIsFile {
-		return nil, errors.Wrapf(wrapErr, "failed to make remote %s:%s to wrap", wName, remotePath)
+		return nil, errors.Wrapf(wrapErr, "failed to make remote %q to wrap", remotePath)
 	}
 	var fsErr error
 	fs.Debugf(name, "wrapped %v:%v at root %v", wrappedFs.Name(), wrappedFs.Root(), rpath)
@@ -389,6 +385,7 @@ func NewFs(name, rootPath string, m configmap.Mapper) (fs.Fs, error) {
 		cleanupChan:      make(chan bool, 1),
 		notifiedRemotes:  make(map[string]bool),
 	}
+	cache.PinUntilFinalized(f.Fs, f)
 	f.rateLimiter = rate.NewLimiter(rate.Limit(float64(opt.Rps)), opt.TotalWorkers)
 
 	f.plexConnector = &plexConnector{}
@@ -482,7 +479,7 @@ func NewFs(name, rootPath string, m configmap.Mapper) (fs.Fs, error) {
 			return nil, errors.Wrapf(err, "failed to create cache directory %v", f.opt.TempWritePath)
 		}
 		f.opt.TempWritePath = filepath.ToSlash(f.opt.TempWritePath)
-		f.tempFs, err = cache.Get(f.opt.TempWritePath)
+		f.tempFs, err = cache.Get(ctx, f.opt.TempWritePath)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to create temp fs: %v", err)
 		}
@@ -509,19 +506,16 @@ func NewFs(name, rootPath string, m configmap.Mapper) (fs.Fs, error) {
 	if doChangeNotify := wrappedFs.Features().ChangeNotify; doChangeNotify != nil {
 		pollInterval := make(chan time.Duration, 1)
 		pollInterval <- time.Duration(f.opt.ChunkCleanInterval)
-		doChangeNotify(context.Background(), f.receiveChangeNotify, pollInterval)
+		doChangeNotify(ctx, f.receiveChangeNotify, pollInterval)
 	}
 
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
 		DuplicateFiles:          false, // storage doesn't permit this
-	}).Fill(f).Mask(wrappedFs).WrapsFs(f, wrappedFs)
+	}).Fill(ctx, f).Mask(ctx, wrappedFs).WrapsFs(f, wrappedFs)
 	// override only those features that use a temp fs and it doesn't support them
 	//f.features.ChangeNotify = f.ChangeNotify
 	if f.opt.TempWritePath != "" {
-		if f.tempFs.Features().Copy == nil {
-			f.features.Copy = nil
-		}
 		if f.tempFs.Features().Move == nil {
 			f.features.Move = nil
 		}
@@ -587,7 +581,7 @@ Some valid examples are:
 "0:10" -> the first ten chunks
 
 Any parameter with a key that starts with "file" can be used to
-specify files to fetch, eg
+specify files to fetch, e.g.
 
     rclone rc cache/fetch chunks=0 file=hello file2=home/goodbye
 
@@ -1242,7 +1236,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 }
 
 // DirMove moves src, srcRemote to this remote at dstRemote
-// using server side move operations.
+// using server-side move operations.
 func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
 	fs.Debugf(f, "move dir '%s'/'%s' -> '%s'/'%s'", src.Root(), srcRemote, f.Root(), dstRemote)
 
@@ -1523,13 +1517,16 @@ func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, opt
 	return f.put(ctx, in, src, options, do)
 }
 
-// Copy src to this remote using server side copy operations.
+// Copy src to this remote using server-side copy operations.
 func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	fs.Debugf(f, "copy obj '%s' -> '%s'", src, remote)
 
 	do := f.Fs.Features().Copy
 	if do == nil {
 		fs.Errorf(src, "source remote (%v) doesn't support Copy", src.Fs())
+		return nil, fs.ErrorCantCopy
+	}
+	if f.opt.TempWritePath != "" && src.Fs() == f.tempFs {
 		return nil, fs.ErrorCantCopy
 	}
 	// the source must be a cached object or we abort
@@ -1597,7 +1594,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	return co, nil
 }
 
-// Move src to this remote using server side move operations.
+// Move src to this remote using server-side move operations.
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	fs.Debugf(f, "moving obj '%s' -> %s", src, remote)
 
@@ -1701,17 +1698,20 @@ func (f *Fs) Hashes() hash.Set {
 	return f.Fs.Hashes()
 }
 
-// Purge all files in the root and the root directory
-func (f *Fs) Purge(ctx context.Context) error {
-	fs.Infof(f, "purging cache")
-	f.cache.Purge()
+// Purge all files in the directory
+func (f *Fs) Purge(ctx context.Context, dir string) error {
+	if dir == "" {
+		// FIXME this isn't quite right as it should purge the dir prefix
+		fs.Infof(f, "purging cache")
+		f.cache.Purge()
+	}
 
 	do := f.Fs.Features().Purge
 	if do == nil {
-		return nil
+		return fs.ErrorCantPurge
 	}
 
-	err := do(ctx)
+	err := do(ctx, dir)
 	if err != nil {
 		return err
 	}
@@ -1828,6 +1828,19 @@ func (f *Fs) isRootInPath(p string) bool {
 	return strings.HasPrefix(p, f.Root()+"/")
 }
 
+// MergeDirs merges the contents of all the directories passed
+// in into the first one and rmdirs the other directories.
+func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) error {
+	do := f.Fs.Features().MergeDirs
+	if do == nil {
+		return errors.New("MergeDirs not supported")
+	}
+	for _, dir := range dirs {
+		_ = f.cache.RemoveDir(dir.Remote())
+	}
+	return do(ctx, dirs)
+}
+
 // DirCacheFlush flushes the dir cache
 func (f *Fs) DirCacheFlush() {
 	_ = f.cache.RemoveDir("")
@@ -1882,6 +1895,41 @@ func (f *Fs) Disconnect(ctx context.Context) error {
 	return do(ctx)
 }
 
+// Shutdown the backend, closing any background tasks and any
+// cached connections.
+func (f *Fs) Shutdown(ctx context.Context) error {
+	do := f.Fs.Features().Shutdown
+	if do == nil {
+		return nil
+	}
+	return do(ctx)
+}
+
+var commandHelp = []fs.CommandHelp{
+	{
+		Name:  "stats",
+		Short: "Print stats on the cache backend in JSON format.",
+	},
+}
+
+// Command the backend to run a named command
+//
+// The command run is name
+// args may be used to read arguments from
+// opts may be used to read optional arguments from
+//
+// The result should be capable of being JSON encoded
+// If it is a string or a []string it will be shown to the user
+// otherwise it will be JSON encoded and shown to the user like that
+func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (interface{}, error) {
+	switch name {
+	case "stats":
+		return f.Stats()
+	default:
+		return nil, fs.ErrorCommandNotFound
+	}
+}
+
 // Check the interfaces are satisfied
 var (
 	_ fs.Fs             = (*Fs)(nil)
@@ -1899,4 +1947,7 @@ var (
 	_ fs.Abouter        = (*Fs)(nil)
 	_ fs.UserInfoer     = (*Fs)(nil)
 	_ fs.Disconnecter   = (*Fs)(nil)
+	_ fs.Commander      = (*Fs)(nil)
+	_ fs.MergeDirser    = (*Fs)(nil)
+	_ fs.Shutdowner     = (*Fs)(nil)
 )

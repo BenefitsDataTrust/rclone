@@ -5,6 +5,8 @@
 package sftp
 
 import (
+	"context"
+
 	"github.com/rclone/rclone/cmd"
 	"github.com/rclone/rclone/cmd/serve/proxy"
 	"github.com/rclone/rclone/cmd/serve/proxy/proxyflags"
@@ -19,12 +21,12 @@ import (
 
 // Options contains options for the http Server
 type Options struct {
-	ListenAddr     string // Port to listen on
-	Key            string // Path to private key
-	AuthorizedKeys string // Path to authorized keys file
-	User           string // single username
-	Pass           string // password for user
-	NoAuth         bool   // allow no authentication on connections
+	ListenAddr     string   // Port to listen on
+	HostKeys       []string // Paths to private host keys
+	AuthorizedKeys string   // Path to authorized keys file
+	User           string   // single username
+	Pass           string   // password for user
+	NoAuth         bool     // allow no authentication on connections
 }
 
 // DefaultOpt is the default values used for Options
@@ -40,7 +42,7 @@ var Opt = DefaultOpt
 func AddFlags(flagSet *pflag.FlagSet, Opt *Options) {
 	rc.AddOption("sftp", &Opt)
 	flags.StringVarP(flagSet, &Opt.ListenAddr, "addr", "", Opt.ListenAddr, "IPaddress:Port or :Port to bind server to.")
-	flags.StringVarP(flagSet, &Opt.Key, "key", "", Opt.Key, "SSH private key file (leave blank to auto generate)")
+	flags.StringArrayVarP(flagSet, &Opt.HostKeys, "key", "", Opt.HostKeys, "SSH private host key file (Can be multi-valued, leave blank to auto generate)")
 	flags.StringVarP(flagSet, &Opt.AuthorizedKeys, "authorized-keys", "", Opt.AuthorizedKeys, "Authorized keys file")
 	flags.StringVarP(flagSet, &Opt.User, "user", "", Opt.User, "User name for authentication.")
 	flags.StringVarP(flagSet, &Opt.Pass, "pass", "", Opt.Pass, "Password for authentication.")
@@ -61,7 +63,7 @@ var Command = &cobra.Command{
 over SFTP.  This can be used with an SFTP client or you can make a
 remote of type sftp to use with it.
 
-You can use the filter flags (eg --include, --exclude) to control what
+You can use the filter flags (e.g. --include, --exclude) to control what
 is served.
 
 The server will log errors.  Use -v to see access logs.
@@ -71,7 +73,7 @@ control the stats printing.
 
 You must provide some means of authentication, either with --user/--pass,
 an authorized keys file (specify location with --authorized-keys - the
-default is the same as ssh) or set the --no-auth flag for no
+default is the same as ssh), an --auth-proxy, or set the --no-auth flag for no
 authentication when logging in.
 
 Note that this also implements a small number of shell commands so
@@ -98,7 +100,7 @@ sftp backend, but it may not be with other SFTP clients.
 			cmd.CheckArgs(0, 0, command, args)
 		}
 		cmd.Run(false, true, command, func() error {
-			s := newServer(f, &Opt)
+			s := newServer(context.Background(), f, &Opt)
 			err := s.Serve()
 			if err != nil {
 				return err

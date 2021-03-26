@@ -96,7 +96,7 @@ func (i *Item) ModTime() (t time.Time) {
 	return t
 }
 
-// ItemResult is returned from the /listfolder, /createfolder, /deletefolder, /deletefile etc methods
+// ItemResult is returned from the /listfolder, /createfolder, /deletefolder, /deletefile, etc. methods
 type ItemResult struct {
 	Error
 	Metadata Item `json:"metadata"`
@@ -104,8 +104,9 @@ type ItemResult struct {
 
 // Hashes contains the supported hashes
 type Hashes struct {
-	SHA1 string `json:"sha1"`
-	MD5  string `json:"md5"`
+	SHA1   string `json:"sha1"`
+	MD5    string `json:"md5"`
+	SHA256 string `json:"sha256"`
 }
 
 // UploadFileResponse is the response from /uploadfile
@@ -150,6 +151,14 @@ type ChecksumFileResult struct {
 	Error
 	Hashes
 	Metadata Item `json:"metadata"`
+}
+
+// PubLinkResult is returned from /getfilepublink and /getfolderpublink
+type PubLinkResult struct {
+	Error
+	LinkID   int    `json:"linkid"`
+	Link     string `json:"link"`
+	LinkCode string `json:"code"`
 }
 
 // UserInfo is returned from /userinfo

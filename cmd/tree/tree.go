@@ -61,7 +61,7 @@ func init() {
 	flags.BoolVarP(cmdFlags, &opts.DirSort, "dirsfirst", "", false, "List directories before files (-U disables).")
 	flags.StringVarP(cmdFlags, &sort, "sort", "", "", "Select sort: name,version,size,mtime,ctime.")
 	// Graphics
-	flags.BoolVarP(cmdFlags, &opts.NoIndent, "noindent", "i", false, "Don't print indentation lines.")
+	flags.BoolVarP(cmdFlags, &opts.NoIndent, "noindent", "", false, "Don't print indentation lines.")
 	flags.BoolVarP(cmdFlags, &opts.Colorize, "color", "C", false, "Turn colorization on always.")
 }
 
@@ -85,7 +85,7 @@ For example
     
     1 directories, 5 files
 
-You can use any of the filtering options with the tree command (eg
+You can use any of the filtering options with the tree command (e.g.
 --include and --exclude).  You can also use --fast-list.
 
 The tree command has many options for controlling the listing which
@@ -108,8 +108,9 @@ short options as they conflict with rclone's short options.
 		opts.CTimeSort = opts.CTimeSort || sort == "ctime"
 		opts.NameSort = sort == "name"
 		opts.SizeSort = sort == "size"
+		ci := fs.GetConfig(context.Background())
 		if opts.DeepLevel == 0 {
-			opts.DeepLevel = fs.Config.MaxDepth
+			opts.DeepLevel = ci.MaxDepth
 		}
 		cmd.Run(false, false, command, func() error {
 			return Tree(fsrc, outFile, &opts)
@@ -143,7 +144,7 @@ func Tree(fsrc fs.Fs, outFile io.Writer, opts *tree.Options) error {
 	return nil
 }
 
-// FileInfo maps a fs.DirEntry into an os.FileInfo
+// FileInfo maps an fs.DirEntry into an os.FileInfo
 type FileInfo struct {
 	entry fs.DirEntry
 }

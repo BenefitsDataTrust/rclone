@@ -12,17 +12,16 @@ require (
 	github.com/abbot/go-http-auth v0.4.0
 	github.com/anacrolix/dms v1.1.0
 	github.com/atotto/clipboard v0.1.2
-	github.com/aws/aws-sdk-go v1.25.31
+	github.com/aws/aws-sdk-go v1.34.0
 	github.com/billziss-gh/cgofuse v1.2.0
 	github.com/djherbis/times v1.2.0
 	github.com/dropbox/dropbox-sdk-go-unofficial v5.4.0+incompatible
 	github.com/etcd-io/bbolt v1.3.3
 	github.com/golang/groupcache v0.0.0-20191027212112-611e8accdfc9 // indirect
-	github.com/google/btree v1.0.0 // indirect
 	github.com/google/go-cmp v0.3.1 // indirect
 	github.com/google/go-querystring v1.0.0 // indirect
 	github.com/gopherjs/gopherjs v0.0.0-20190812055157-5d271430af9f // indirect
-	github.com/jlaffaye/ftp v0.0.0-20191025175106-a59fe673c9b2
+	github.com/jlaffaye/ftp v0.0.0-20191025175106-a59fe673c9b2 // indirect
 	github.com/jzelinskie/whirlpool v0.0.0-20170603002051-c19460b8caa6
 	github.com/kardianos/osext v0.0.0-20190222173326-2bc1f35cddc0 // indirect
 	github.com/konsorten/go-windows-terminal-sequences v1.0.2 // indirect
@@ -40,7 +39,7 @@ require (
 	github.com/onsi/ginkgo v1.9.0 // indirect
 	github.com/onsi/gomega v1.6.0 // indirect
 	github.com/patrickmn/go-cache v2.1.0+incompatible
-	github.com/pkg/errors v0.8.1
+	github.com/pkg/errors v0.9.1
 	github.com/pkg/sftp v1.10.1
 	github.com/putdotio/go-putio v0.0.0-20190822121956-19b9c636c877
 	github.com/rfjakob/eme v0.0.0-20171028163933-2222dbd4ba46
@@ -51,7 +50,7 @@ require (
 	github.com/smartystreets/goconvey v0.0.0-20190731233626-505e41936337 // indirect
 	github.com/spf13/cobra v0.0.5
 	github.com/spf13/pflag v1.0.5
-	github.com/stretchr/testify v1.4.0
+	github.com/stretchr/testify v1.5.1
 	github.com/t3rm1n4l/go-mega v0.0.0-20191014094753-e8695d78299a
 	github.com/xanzy/ssh-agent v0.2.1
 	github.com/youmark/pkcs8 v0.0.0-20191102193632-94c173a94d60
@@ -60,7 +59,7 @@ require (
 	go.opencensus.io v0.22.2 // indirect
 	goftp.io/server v0.0.0-20190812052725-72a57b186803
 	golang.org/x/crypto v0.0.0-20191108234033-bd318be0434a
-	golang.org/x/net v0.0.0-20191109021931-daa7c04131f5
+	golang.org/x/net v0.0.0-20200202094626-16171245cfb2
 	golang.org/x/oauth2 v0.0.0-20190604053449-0f29369cfe45
 	golang.org/x/sync v0.0.0-20190911185100-cd5d95a43a6e
 	golang.org/x/sys v0.0.0-20191113165036-4c7a9d0fe056
